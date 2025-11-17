@@ -3,6 +3,7 @@ from fyers_apiv3 import fyersModel
 import pandas as pd
 import numpy as np
 import datetime as dt
+import altair as alt
 
 # ========================= FYERS SETUP =========================
 # Make sure 'access.txt' exists and contains your access token
@@ -141,7 +142,6 @@ def add_moving_averages(df, ma_type, fast_period, slow_period):
 def calc_level(entry_price, level_type, level_value, direction="long"):
     """
     Calculates TP & SL price based on points or percent.
-    Currently used for long only, but supports both directions.
     """
     if level_type == "Points":
         if direction == "long":
@@ -315,24 +315,21 @@ def backtest_ma_crossover(
     avg_return = trades_df['Return %'].mean()
     cum_return = trades_df['Return %'].sum()
 
-    # ---------- Monthly stats (safe) ----------
-    if 'Entry Time' in trades_df.columns and len(trades_df) > 0:
-        trades_df['Month'] = trades_df['Entry Time'].dt.to_period('M').astype(str)
-        monthly_stats = (
-            trades_df
-            .groupby('Month', as_index=False)
-            .agg(
-                Trades=('PnL Points', 'count'),
-                Wins=('PnL Points', lambda x: (x > 0).sum()),
-                Losses=('PnL Points', lambda x: (x < 0).sum()),
-                WinRatePct=('PnL Points', lambda x: (x > 0).mean() * 100.0),
-                NetPoints=('PnL Points', 'sum'),
-                AvgReturnPct=('Return %', 'mean'),
-                CumReturnPct=('Return %', 'sum')
-            )
+    # ---------- Monthly stats ----------
+    trades_df['Month'] = trades_df['Entry Time'].dt.to_period('M').astype(str)
+    monthly_stats = (
+        trades_df
+        .groupby('Month', as_index=False)
+        .agg(
+            Trades=('PnL Points', 'count'),
+            Wins=('PnL Points', lambda x: (x > 0).sum()),
+            Losses=('PnL Points', lambda x: (x < 0).sum()),
+            WinRatePct=('PnL Points', lambda x: (x > 0).mean() * 100.0),
+            NetPoints=('PnL Points', 'sum'),
+            AvgReturnPct=('Return %', 'mean'),
+            CumReturnPct=('Return %', 'sum')
         )
-    else:
-        monthly_stats = pd.DataFrame()
+    )
 
     summary = {
         "total_trades": total_trades,
@@ -347,6 +344,53 @@ def backtest_ma_crossover(
     }
 
     return trades_df, summary
+
+# ===================== ANALYTICS HELPERS =======================
+
+def build_daily_stats(trades_df):
+    """Aggregate to daily PnL and build equity & drawdown."""
+    daily = (
+        trades_df
+        .groupby('Entry Date', as_index=False)
+        .agg(PnLPoints=('PnL Points', 'sum'),
+             Trades=('PnL Points', 'count'))
+        .rename(columns={'Entry Date': 'Date'})
+    )
+    daily['Date'] = pd.to_datetime(daily['Date'])
+    daily = daily.sort_values('Date').reset_index(drop=True)
+
+    daily['CumPnL'] = daily['PnLPoints'].cumsum()
+    daily['Peak'] = daily['CumPnL'].cummax()
+    daily['Drawdown'] = daily['CumPnL'] - daily['Peak']
+
+    return daily
+
+def compute_risk_stats(daily):
+    """Basic risk stats like best/worst day and max DD."""
+    if daily.empty:
+        return {}
+
+    best_day = daily.loc[daily['PnLPoints'].idxmax()]
+    worst_day = daily.loc[daily['PnLPoints'].idxmin()]
+    max_dd = daily['Drawdown'].min()  # negative
+    avg_daily = daily['PnLPoints'].mean()
+
+    return {
+        "best_day_date": best_day['Date'].date(),
+        "best_day_pnl": best_day['PnLPoints'],
+        "worst_day_date": worst_day['Date'].date(),
+        "worst_day_pnl": worst_day['PnLPoints'],
+        "max_drawdown": max_dd,
+        "avg_daily_pnl": avg_daily,
+    }
+
+def build_calendar_df(daily):
+    """Prepare data for a calendar-like heatmap using Altair."""
+    cal = daily.copy()
+    cal['Year'] = cal['Date'].dt.year
+    cal['Month'] = cal['Date'].dt.month_name().str[:3]
+    cal['Day'] = cal['Date'].dt.day
+    return cal
 
 # ======================= STREAMLIT UI ==========================
 
@@ -391,7 +435,7 @@ max_date = dt.date.today()
 
 start_date = st.sidebar.date_input(
     "Start Date",
-    value=max_date - dt.timedelta(days=30),
+    value=max_date - dt.timedelta(days=180),
     min_value=min_date,
     max_value=max_date
 )
@@ -436,19 +480,13 @@ st.sidebar.markdown("---")
 run_button = st.sidebar.button("🚀 Run Backtest")
 
 # ========================= MAIN LAYOUT =========================
-col1, col2 = st.columns([2, 1])
 
-with col1:
-    st.subheader("Historical Data & Moving Averages")
-
-with col2:
-    st.subheader("Backtest Summary")
-
-# ---------- Validate date ----------
+# Top info area
 if start_date > end_date:
     st.error("⚠️ Start date must not be after end date.")
 else:
     fyers_symbol = build_fyers_symbol(segment, exchange, symbol, year, month, day, strike, opt_type)
+    st.caption(f"Symbol: **{fyers_symbol}**  |  Date Range: {start_date} → {end_date}  |  TF: {resolution}")
 
     if run_button:
         with st.spinner(f"Fetching data & running backtest for {fyers_symbol}..."):
@@ -471,33 +509,211 @@ else:
                     tp_value=tp_value,
                 )
 
-                # ---------- Left: data + MA preview ----------
-                with col1:
-                    st.success("✅ Data fetched & backtest completed.")
-                    ma_df = add_moving_averages(price_df, ma_type, fast_period, slow_period)
-                    st.write("Last 50 candles with MAs:")
-                    st.dataframe(ma_df[['Open', 'High', 'Low', 'Close', 'fast_ma', 'slow_ma']].tail(50))
+                if trades_df.empty:
+                    st.warning("No trades generated with the selected parameters.")
+                else:
+                    # ======= KPI ROWS (like your reference image) =======
+                    st.markdown("## 📊 Overview")
 
+                    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+                    kpi1.metric("Total Trades", summary["total_trades"])
+                    kpi2.metric("Profitable Trades", summary["wins"])
+                    kpi3.metric("Loss-making Trades", summary["losses"])
+                    kpi4.metric("Win Rate (%)", f"{summary['win_rate']:.2f}")
+
+                    kpi5, kpi6, kpi7, kpi8 = st.columns(4)
+                    kpi5.metric("Net PnL (Points)", f"{summary['net_points']:.2f}")
+                    kpi6.metric("Avg Return / Trade (%)", f"{summary['avg_return']:.2f}")
+                    kpi7.metric("Cumulative Return (%)", f"{summary['cum_return']:.2f}")
+                    kpi8.metric("Breakeven Trades", summary["breakeven"])
+
+                    # Daily stats & risk
+                    daily_stats = build_daily_stats(trades_df)
+                    risk = compute_risk_stats(daily_stats)
+
+                    kpi9, kpi10, kpi11, kpi12 = st.columns(4)
+                    if risk:
+                        kpi9.metric("Best Day PnL", f"{risk['best_day_pnl']:.2f}", str(risk['best_day_date']))
+                        kpi10.metric("Worst Day PnL", f"{risk['worst_day_pnl']:.2f}", str(risk['worst_day_date']))
+                        kpi11.metric("Max Drawdown (Points)", f"{risk['max_drawdown']:.2f}")
+                        kpi12.metric("Avg Daily PnL (Points)", f"{risk['avg_daily_pnl']:.2f}")
+                    else:
+                        kpi9.metric("Best Day PnL", "–")
+                        kpi10.metric("Worst Day PnL", "–")
+                        kpi11.metric("Max Drawdown", "–")
+                        kpi12.metric("Avg Daily PnL", "–")
+
+                    st.markdown("---")
+
+                    # ======= Calendar-style daily heatmap =======
+                    st.markdown("### 📅 Daily PnL Calendar Heatmap")
+
+                    cal_df = build_calendar_df(daily_stats)
+                    if not cal_df.empty:
+                        cal_chart = (
+                            alt.Chart(cal_df)
+                            .mark_rect()
+                            .encode(
+                                x=alt.X('day(Date):O', title='Day of Month'),
+                                y=alt.Y('month(Date):O', title='Month'),
+                                color=alt.Color('PnLPoints:Q', title='PnL (Pts)',
+                                                scale=alt.Scale(scheme='redblue', domainMid=0)),
+                                tooltip=['Date:T', 'PnLPoints:Q', 'Trades:Q']
+                            )
+                            .properties(height=250)
+                        )
+                        st.altair_chart(cal_chart, use_container_width=True)
+                    else:
+                        st.info("No daily stats available.")
+
+                    st.markdown("---")
+
+                    # ======= Price + MA preview =======
+                    st.markdown("### 📈 Price with Moving Averages")
+                    ma_df = add_moving_averages(price_df, ma_type, fast_period, slow_period)
+                    st.dataframe(ma_df[['Open', 'High', 'Low', 'Close', 'fast_ma', 'slow_ma']].tail(50))
                     st.line_chart(ma_df[['Close', 'fast_ma', 'slow_ma']].tail(500))
 
-                # ---------- Right: summary ----------
-                with col2:
-                    if trades_df.empty:
-                        st.warning("No trades generated with the selected parameters.")
+                    st.markdown("---")
+
+                    # ======= Performance Charts (like equity, DD, daily, monthly) =======
+                    st.markdown("## 📉 Performance Charts")
+
+                    # Equity & Drawdown
+                    col_e1, col_e2 = st.columns(2)
+
+                    with col_e1:
+                        st.markdown("#### Equity Curve (Cumulative PnL)")
+                        eq_chart = (
+                            alt.Chart(daily_stats)
+                            .mark_line()
+                            .encode(
+                                x='Date:T',
+                                y=alt.Y('CumPnL:Q', title='Cumulative PnL (Points)'),
+                                tooltip=['Date:T', 'CumPnL:Q']
+                            )
+                        )
+                        st.altair_chart(eq_chart, use_container_width=True)
+
+                    with col_e2:
+                        st.markdown("#### Drawdown Curve")
+                        dd_chart = (
+                            alt.Chart(daily_stats)
+                            .mark_line()
+                            .encode(
+                                x='Date:T',
+                                y=alt.Y('Drawdown:Q', title='Drawdown (Points)'),
+                                tooltip=['Date:T', 'Drawdown:Q']
+                            )
+                        )
+                        st.altair_chart(dd_chart, use_container_width=True)
+
+                    # Daily PnL & Daily Trades
+                    col_d1, col_d2 = st.columns(2)
+
+                    with col_d1:
+                        st.markdown("#### Daily PnL (Points)")
+                        daily_pnl_chart = (
+                            alt.Chart(daily_stats)
+                            .mark_bar()
+                            .encode(
+                                x='Date:T',
+                                y=alt.Y('PnLPoints:Q', title='PnL (Points)'),
+                                tooltip=['Date:T', 'PnLPoints:Q', 'Trades:Q'],
+                                color=alt.condition(
+                                    alt.datum.PnLPoints >= 0,
+                                    alt.value("green"),
+                                    alt.value("red")
+                                )
+                            )
+                        )
+                        st.altair_chart(daily_pnl_chart, use_container_width=True)
+
+                    with col_d2:
+                        st.markdown("#### Daily Number of Trades")
+                        daily_trades_chart = (
+                            alt.Chart(daily_stats)
+                            .mark_bar()
+                            .encode(
+                                x='Date:T',
+                                y=alt.Y('Trades:Q', title='Number of Trades'),
+                                tooltip=['Date:T', 'Trades:Q']
+                            )
+                        )
+                        st.altair_chart(daily_trades_chart, use_container_width=True)
+
+                    # Monthly PnL & Monthly WinRate
+                    st.markdown("### 📆 Monthly Statistics")
+
+                    monthly_stats = summary["monthly_stats"]
+                    if monthly_stats is not None and not monthly_stats.empty:
+                        col_m1, col_m2 = st.columns(2)
+
+                        with col_m1:
+                            st.markdown("#### Monthly Net PnL (Points)")
+                            ms_pnl_chart = (
+                                alt.Chart(monthly_stats)
+                                .mark_bar()
+                                .encode(
+                                    x=alt.X('Month:O', sort=None),
+                                    y=alt.Y('NetPoints:Q', title='Net PnL (Points)'),
+                                    tooltip=['Month', 'NetPoints', 'Trades'],
+                                    color=alt.condition(
+                                        alt.datum.NetPoints >= 0,
+                                        alt.value("green"),
+                                        alt.value("red")
+                                    )
+                                )
+                            )
+                            st.altair_chart(ms_pnl_chart, use_container_width=True)
+
+                        with col_m2:
+                            st.markdown("#### Monthly Win Rate (%)")
+                            ms_wr_chart = (
+                                alt.Chart(monthly_stats)
+                                .mark_bar()
+                                .encode(
+                                    x=alt.X('Month:O', sort=None),
+                                    y=alt.Y('WinRatePct:Q', title='Win Rate (%)'),
+                                    tooltip=['Month', 'WinRatePct', 'Trades']
+                                )
+                            )
+                            st.altair_chart(ms_wr_chart, use_container_width=True)
+
+                        st.dataframe(monthly_stats)
                     else:
-                        st.metric("Total Trades", summary["total_trades"])
-                        st.metric("Profitable Trades", summary["wins"])
-                        st.metric("Loss-making Trades", summary["losses"])
-                        st.metric("Win Rate (%)", f"{summary['win_rate']:.2f}")
-                        st.metric("Net PnL (Points)", f"{summary['net_points']:.2f}")
-                        st.metric("Avg Return / Trade (%)", f"{summary['avg_return']:.2f}")
-                        st.metric("Cumulative Return (%)", f"{summary['cum_return']:.2f}")
+                        st.info("No monthly stats available.")
 
-                # ---------- Detailed section ----------
-                st.markdown("---")
-                st.subheader("📊 Trades Details")
+                    st.markdown("---")
 
-                if not trades_df.empty:
+                    # ======= Distribution Pie (Win / Loss / BE) =======
+                    st.markdown("### 🥧 Trade Outcome Distribution")
+
+                    outcome_counts = {
+                        "Wins": summary["wins"],
+                        "Losses": summary["losses"],
+                        "Breakeven": summary["breakeven"],
+                    }
+                    dist_df = pd.DataFrame(
+                        {"Outcome": list(outcome_counts.keys()),
+                         "Count": list(outcome_counts.values())}
+                    )
+
+                    pie_chart = (
+                        alt.Chart(dist_df)
+                        .mark_arc(innerRadius=40)
+                        .encode(
+                            theta='Count:Q',
+                            color='Outcome:N',
+                            tooltip=['Outcome', 'Count']
+                        )
+                    )
+                    st.altair_chart(pie_chart, use_container_width=False)
+
+                    st.markdown("---")
+
+                    # ======= Trades Table & Download =======
+                    st.markdown("## 📋 Trades Table")
                     st.dataframe(trades_df)
 
                     st.download_button(
@@ -507,15 +723,5 @@ else:
                         mime="text/csv"
                     )
 
-                    st.markdown("### 📅 Monthly Statistics")
-                    monthly_stats = summary.get("monthly_stats")
-                    if monthly_stats is not None and not monthly_stats.empty:
-                        st.dataframe(monthly_stats)
-
-                        # Bar chart of NetPoints per month
-                        ms_chart = monthly_stats.set_index("Month")[["NetPoints"]]
-                        st.bar_chart(ms_chart)
-                    else:
-                        st.info("No monthly stats available (no trades).")
     else:
         st.info("Set your parameters on the left and click **Run Backtest** to start.")
