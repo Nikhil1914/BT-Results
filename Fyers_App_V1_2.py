@@ -171,12 +171,15 @@ def backtest_ma_crossover(
     sl_value=50.0,
     tp_type="Points",
     tp_value=100.0,
+    trade_mode="Intraday",  # <-- NEW
 ):
     """
     Long-only MA/EMA crossover backtest.
-    - Entry: fast MA crosses above slow MA (signal=1) → enter at next bar open
-    - Exit: SL / Target hit inside bar (High/Low), or EOD (no overnight)
-    - Intraday session filter: 09:15–15:30 for intraday resolutions.
+
+    trade_mode:
+        - "Intraday": exit by 14:55 each day, no overnight.
+        - "Positional": keep across days, exit only at TP/SL
+                        (or final bar of backtest).
     """
     if df.empty:
         return pd.DataFrame(), {}
@@ -184,7 +187,7 @@ def backtest_ma_crossover(
     df = df.copy()
     df = df.sort_index()
 
-    # Intraday filter only if intraday resolution
+    # Intraday filter only if intraday resolution (both modes)
     intraday_resolutions = {"1", "2", "3", "5", "10", "15", "20", "30", "60", "120", "240"}
     if resolution in intraday_resolutions:
         df = df.between_time("09:15", "15:30")
@@ -204,6 +207,8 @@ def backtest_ma_crossover(
     sl_price = None
     trade_date = None
 
+    intraday_exit_time = dt.time(14, 55)  # 2:55 PM
+
     for i in range(1, len(df)):
         row = df.iloc[i]
         prev_row = df.iloc[i - 1]
@@ -211,8 +216,9 @@ def backtest_ma_crossover(
         prev_ts = df.index[i - 1]
         signal_prev = prev_row['signal']
 
-        # Exit on day change using previous bar close
-        if in_trade and ts.date() != trade_date:
+        # ---------- FORCED EXIT ON DAY CHANGE ----------
+        # Only in INTRADAY mode (no overnight)
+        if in_trade and trade_mode == "Intraday" and ts.date() != trade_date:
             exit_price = prev_row['Close']
             exit_time = prev_ts
             pnl_points = exit_price - entry_price
@@ -230,7 +236,7 @@ def backtest_ma_crossover(
             in_trade = False
             entry_price = entry_time = tp_price = sl_price = trade_date = None
 
-        # Manage open trade: SL / TP inside current candle
+        # ---------- MANAGE OPEN TRADE: SL / TP ----------
         if in_trade:
             bar_high = row['High']
             bar_low = row['Low']
@@ -270,7 +276,28 @@ def backtest_ma_crossover(
                     entry_price = entry_time = tp_price = sl_price = trade_date = None
                     continue  # move to next candle
 
-        # New entry condition (no open trade)
+        # ---------- INTRADAY EOD EXIT AT 14:55 ----------
+        if in_trade and trade_mode == "Intraday":
+            if ts.time() >= intraday_exit_time and ts.date() == trade_date:
+                exit_price = row['Close']
+                exit_time = ts
+                pnl_points = exit_price - entry_price
+                trades.append({
+                    "Entry Time": entry_time,
+                    "Exit Time": exit_time,
+                    "Direction": direction,
+                    "Entry Price": entry_price,
+                    "Exit Price": exit_price,
+                    "PnL Points": pnl_points,
+                    "Return %": (pnl_points / entry_price) * 100.0,
+                    "Exit Reason": "Intraday EOD 14:55",
+                    "Entry Date": entry_time.date()
+                })
+                in_trade = False
+                entry_price = entry_time = tp_price = sl_price = trade_date = None
+                continue
+
+        # ---------- NEW ENTRY ----------
         if (not in_trade) and (signal_prev == 1):
             entry_price = row['Open']
             entry_time = ts
@@ -279,13 +306,14 @@ def backtest_ma_crossover(
             tp_price, sl_price = calc_level(entry_price, tp_type, tp_value, direction)
             in_trade = True
 
-    # Close open trade at last bar if still open
+    # ---------- FINAL OPEN TRADE EXIT (end of data) ----------
     if in_trade:
         last_row = df.iloc[-1]
         last_ts = df.index[-1]
         exit_price = last_row['Close']
         exit_time = last_ts
         pnl_points = exit_price - entry_price
+        reason = "EOD (last bar)" if trade_mode == "Intraday" else "Backtest end"
         trades.append({
             "Entry Time": entry_time,
             "Exit Time": exit_time,
@@ -294,7 +322,7 @@ def backtest_ma_crossover(
             "Exit Price": exit_price,
             "PnL Points": pnl_points,
             "Return %": (pnl_points / entry_price) * 100.0,
-            "Exit Reason": "EOD (last bar)",
+            "Exit Reason": reason,
             "Entry Date": entry_time.date()
         })
 
@@ -476,6 +504,10 @@ tp_value = st.sidebar.number_input(f"Target ({tp_type})", min_value=0.0, value=1
 sl_type = st.sidebar.selectbox("Stop Loss Type", ["Points", "Percent"], index=0)
 sl_value = st.sidebar.number_input(f"Stop Loss ({sl_type})", min_value=0.0, value=50.0, step=1.0)
 
+# ---------- NEW: Trade Mode ----------
+st.sidebar.markdown("---")
+trade_mode = st.sidebar.radio("Trade Mode", ["Intraday", "Positional"], index=0)
+
 st.sidebar.markdown("---")
 run_button = st.sidebar.button("🚀 Run Backtest")
 
@@ -486,7 +518,9 @@ if start_date > end_date:
     st.error("⚠️ Start date must not be after end date.")
 else:
     fyers_symbol = build_fyers_symbol(segment, exchange, symbol, year, month, day, strike, opt_type)
-    st.caption(f"Symbol: **{fyers_symbol}**  |  Date Range: {start_date} → {end_date}  |  TF: {resolution}")
+    st.caption(
+        f"Symbol: **{fyers_symbol}**  |  Date Range: {start_date} → {end_date}  |  TF: {resolution}  |  Mode: **{trade_mode}**"
+    )
 
     if run_button:
         with st.spinner(f"Fetching data & running backtest for {fyers_symbol}..."):
@@ -507,12 +541,13 @@ else:
                     sl_value=sl_value,
                     tp_type=tp_type,
                     tp_value=tp_value,
+                    trade_mode=trade_mode,   # <-- pass mode
                 )
 
                 if trades_df.empty:
                     st.warning("No trades generated with the selected parameters.")
                 else:
-                    # ======= KPI ROWS (like your reference image) =======
+                    # ======= KPI ROWS =======
                     st.markdown("## 📊 Overview")
 
                     kpi1, kpi2, kpi3, kpi4 = st.columns(4)
@@ -556,8 +591,11 @@ else:
                             .encode(
                                 x=alt.X('day(Date):O', title='Day of Month'),
                                 y=alt.Y('month(Date):O', title='Month'),
-                                color=alt.Color('PnLPoints:Q', title='PnL (Pts)',
-                                                scale=alt.Scale(scheme='redblue', domainMid=0)),
+                                color=alt.Color(
+                                    'PnLPoints:Q',
+                                    title='PnL (Pts)',
+                                    scale=alt.Scale(scheme='redblue', domainMid=0)
+                                ),
                                 tooltip=['Date:T', 'PnLPoints:Q', 'Trades:Q']
                             )
                             .properties(height=250)
@@ -576,7 +614,7 @@ else:
 
                     st.markdown("---")
 
-                    # ======= Performance Charts (like equity, DD, daily, monthly) =======
+                    # ======= Performance Charts =======
                     st.markdown("## 📉 Performance Charts")
 
                     # Equity & Drawdown
