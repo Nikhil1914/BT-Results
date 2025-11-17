@@ -1,4 +1,3 @@
-# %%
 import streamlit as st
 from fyers_apiv3 import fyersModel
 import pandas as pd
@@ -6,15 +5,18 @@ import numpy as np
 import datetime as dt
 
 # ========================= FYERS SETUP =========================
-# Load access token (same as your current app)
+# Make sure 'access.txt' exists and contains your access token
 with open('access.txt', 'r') as a:
     access_token = a.read().strip()
 
-client_id = 'KB4YGO9V7J-100'
+client_id = 'KB4YGO9V7J-100'   # change if needed
 fyers = fyersModel.FyersModel(client_id=client_id, is_async=False, token=access_token, log_path="")
 
 # ==================== SYMBOL BUILD FUNCTION ====================
 def build_fyers_symbol(segment, exchange, symbol, year=None, month=None, day=None, strike=None, opt_type=None):
+    """
+    Builds Fyers symbol string based on segment / exchange / expiry / strike etc.
+    """
     if segment == "Equity":
         return f"{exchange}:{symbol}-EQ"
     elif segment == "Index":
@@ -32,18 +34,24 @@ def build_fyers_symbol(segment, exchange, symbol, year=None, month=None, day=Non
 
 # =================== HISTORICAL DATA FETCH =====================
 def fetch_data(symbol, start_date, end_date, resolution="60"):
+    """
+    Fetch data from Fyers API in chunks and return a OHLCV(+OI) DataFrame indexed by Date.
+    Date is converted to IST and timezone removed.
+    """
     df = pd.DataFrame()
+
     resolution_minutes = {
         "1": 1, "2": 2, "3": 3, "5": 5, "10": 10, "15": 15,
         "20": 20, "30": 30, "60": 60, "120": 120, "240": 240
     }
 
+    # Decide chunk size
     if resolution in resolution_minutes:
-        chunk_days = 100
+        chunk_days = 100       # intraday
     elif resolution in ["D", "1D"]:
-        chunk_days = 366
+        chunk_days = 366       # daily
     elif resolution in ["W", "M"]:
-        chunk_days = 365 * 3
+        chunk_days = 365 * 3   # weekly / monthly
     else:
         st.error("Resolution not supported for long-range.")
         return df
@@ -67,14 +75,18 @@ def fetch_data(symbol, start_date, end_date, resolution="60"):
             if 'candles' in response and response['candles']:
                 first_candle_len = len(response['candles'][0])
                 if first_candle_len == 7:
-                    chunk = pd.DataFrame(response['candles'], columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
+                    chunk = pd.DataFrame(response['candles'],
+                                         columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
                 elif first_candle_len == 6:
-                    chunk = pd.DataFrame(response['candles'], columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume'])
+                    chunk = pd.DataFrame(response['candles'],
+                                         columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume'])
                     chunk['OI'] = None
                 else:
                     st.error(f"Unexpected candle format from {current_start} to {current_end}")
+                    current_start = current_end + dt.timedelta(days=1)
                     continue
 
+                # Convert timestamp to IST and drop tz
                 chunk['Date'] = pd.to_datetime(chunk['Date'], unit='s')
                 chunk['Date'] = (
                     chunk['Date']
@@ -84,6 +96,7 @@ def fetch_data(symbol, start_date, end_date, resolution="60"):
                 )
                 chunk = chunk.set_index('Date')
                 chunk['Symbol'] = symbol
+
                 df = pd.concat([df, chunk])
         except Exception as e:
             st.error(f"Error from {current_start} to {current_end}: {e}")
@@ -93,9 +106,13 @@ def fetch_data(symbol, start_date, end_date, resolution="60"):
     df = df[~df.index.duplicated(keep='first')]
     return df
 
-# ===================== BACKTESTING LOGIC =======================
+# ===================== INDICATOR FUNCTIONS =====================
 
 def add_moving_averages(df, ma_type, fast_period, slow_period):
+    """
+    Adds fast_ma and slow_ma columns (SMA or EMA) and generates entry/exit 'signal'.
+    signal = 1 => bullish crossover, signal = -1 => bearish crossover.
+    """
     df = df.copy()
     price = df['Close']
 
@@ -106,23 +123,26 @@ def add_moving_averages(df, ma_type, fast_period, slow_period):
         df['fast_ma'] = price.ewm(span=fast_period, adjust=False).mean()
         df['slow_ma'] = price.ewm(span=slow_period, adjust=False).mean()
 
-    # Long-only crossover signals
     df['signal'] = 0
     df.loc[
         (df['fast_ma'] > df['slow_ma']) &
         (df['fast_ma'].shift(1) <= df['slow_ma'].shift(1)),
         'signal'
-    ] = 1   # Bullish crossover (entry)
+    ] = 1   # Bullish crossover
 
     df.loc[
         (df['fast_ma'] < df['slow_ma']) &
         (df['fast_ma'].shift(1) >= df['slow_ma'].shift(1)),
         'signal'
-    ] = -1  # Bearish crossover (can be used as exit)
+    ] = -1  # Bearish (used for exit logic if needed)
 
     return df
 
-def calc_level(entry_price, level_type, level_value, direction):
+def calc_level(entry_price, level_type, level_value, direction="long"):
+    """
+    Calculates TP & SL price based on points or percent.
+    Currently used for long only, but supports both directions.
+    """
     if level_type == "Points":
         if direction == "long":
             tp_price = entry_price + level_value
@@ -131,18 +151,19 @@ def calc_level(entry_price, level_type, level_value, direction):
             tp_price = entry_price - level_value
             sl_price = entry_price + level_value
     else:  # Percent
-        tp_factor = 1 + (level_value / 100.0)
-        sl_factor = 1 - (level_value / 100.0)
         if direction == "long":
-            tp_price = entry_price * tp_factor
-            sl_price = entry_price * sl_factor
+            tp_price = entry_price * (1 + level_value / 100.0)
+            sl_price = entry_price * (1 - level_value / 100.0)
         else:
-            tp_price = entry_price * (2 - tp_factor)  # basically -% from entry
-            sl_price = entry_price * (2 - sl_factor)  # basically +% from entry
+            tp_price = entry_price * (1 - level_value / 100.0)
+            sl_price = entry_price * (1 + level_value / 100.0)
     return tp_price, sl_price
+
+# ===================== BACKTESTING LOGIC =======================
 
 def backtest_ma_crossover(
     df,
+    resolution,
     ma_type="SMA",
     fast_period=9,
     slow_period=21,
@@ -151,21 +172,27 @@ def backtest_ma_crossover(
     tp_type="Points",
     tp_value=100.0,
 ):
+    """
+    Long-only MA/EMA crossover backtest.
+    - Entry: fast MA crosses above slow MA (signal=1) → enter at next bar open
+    - Exit: SL / Target hit inside bar (High/Low), or EOD (no overnight)
+    - Intraday session filter: 09:15–15:30 for intraday resolutions.
+    """
     if df.empty:
         return pd.DataFrame(), {}
 
     df = df.copy()
     df = df.sort_index()
 
-    # Intraday filter for Indian market (09:15 to 15:30) for intraday frames
-    if df.index.freq is None:  # just in case, use string check instead
-        # We know resolution from outside, but simplest is time filter:
+    # Intraday filter only if intraday resolution
+    intraday_resolutions = {"1", "2", "3", "5", "10", "15", "20", "30", "60", "120", "240"}
+    if resolution in intraday_resolutions:
         df = df.between_time("09:15", "15:30")
 
     if df.empty:
         return pd.DataFrame(), {}
 
-    # Add moving averages & signals
+    # Indicators and signals
     df = add_moving_averages(df, ma_type, fast_period, slow_period)
 
     trades = []
@@ -177,8 +204,6 @@ def backtest_ma_crossover(
     sl_price = None
     trade_date = None
 
-    prev_row = None
-
     for i in range(1, len(df)):
         row = df.iloc[i]
         prev_row = df.iloc[i - 1]
@@ -186,7 +211,7 @@ def backtest_ma_crossover(
         prev_ts = df.index[i - 1]
         signal_prev = prev_row['signal']
 
-        # Exit at day change (no overnight) using previous bar close
+        # Exit on day change using previous bar close
         if in_trade and ts.date() != trade_date:
             exit_price = prev_row['Close']
             exit_time = prev_ts
@@ -199,12 +224,13 @@ def backtest_ma_crossover(
                 "Exit Price": exit_price,
                 "PnL Points": pnl_points,
                 "Return %": (pnl_points / entry_price) * 100.0,
+                "Exit Reason": "EOD (day change)",
                 "Entry Date": entry_time.date()
             })
             in_trade = False
             entry_price = entry_time = tp_price = sl_price = trade_date = None
 
-        # Manage open trade: check SL / TP on current candle
+        # Manage open trade: SL / TP inside current candle
         if in_trade:
             bar_high = row['High']
             bar_low = row['Low']
@@ -213,7 +239,6 @@ def backtest_ma_crossover(
                 hit_tp = bar_high >= tp_price
                 hit_sl = bar_low <= sl_price
 
-                # If both hit in same bar, assume SL first (conservative)
                 if hit_sl and hit_tp:
                     exit_price = sl_price
                     exit_reason = "SL&TP same bar (SL priority)"
@@ -243,11 +268,10 @@ def backtest_ma_crossover(
                     })
                     in_trade = False
                     entry_price = entry_time = tp_price = sl_price = trade_date = None
-                    continue  # go to next candle
+                    continue  # move to next candle
 
-        # If still not in trade, look for new entry
+        # New entry condition (no open trade)
         if (not in_trade) and (signal_prev == 1):
-            # Enter at current bar open after previous bar signal
             entry_price = row['Open']
             entry_time = ts
             trade_date = ts.date()
@@ -255,7 +279,7 @@ def backtest_ma_crossover(
             tp_price, sl_price = calc_level(entry_price, tp_type, tp_value, direction)
             in_trade = True
 
-    # If trade still open at last bar, close at last close
+    # Close open trade at last bar if still open
     if in_trade:
         last_row = df.iloc[-1]
         last_ts = df.index[-1]
@@ -281,7 +305,7 @@ def backtest_ma_crossover(
     trades_df['Entry Time'] = pd.to_datetime(trades_df['Entry Time'])
     trades_df['Exit Time'] = pd.to_datetime(trades_df['Exit Time'])
 
-    # Summary stats
+    # ---------- Summary stats ----------
     total_trades = len(trades_df)
     wins = (trades_df['PnL Points'] > 0).sum()
     losses = (trades_df['PnL Points'] < 0).sum()
@@ -291,21 +315,24 @@ def backtest_ma_crossover(
     avg_return = trades_df['Return %'].mean()
     cum_return = trades_df['Return %'].sum()
 
-    monthly_stats = (
-        trades_df
-        .groupby('Month')
-        .agg(
-        Trades=('PnL Points', 'count'),
-        Wins=('PnL Points', lambda x: (x > 0).sum()),
-        Losses=('PnL Points', lambda x: (x < 0).sum()),
-        WinRatePct=('PnL Points', lambda x: (x > 0).mean() * 100.0),
-        NetPoints=('PnL Points', 'sum'),
-        AvgReturnPct=('Return %', 'mean'),
-        CumReturnPct=('Return %', 'sum')
-    )
-    .reset_index()
-)
-
+    # ---------- Monthly stats (safe) ----------
+    if 'Entry Time' in trades_df.columns and len(trades_df) > 0:
+        trades_df['Month'] = trades_df['Entry Time'].dt.to_period('M').astype(str)
+        monthly_stats = (
+            trades_df
+            .groupby('Month', as_index=False)
+            .agg(
+                Trades=('PnL Points', 'count'),
+                Wins=('PnL Points', lambda x: (x > 0).sum()),
+                Losses=('PnL Points', lambda x: (x < 0).sum()),
+                WinRatePct=('PnL Points', lambda x: (x > 0).mean() * 100.0),
+                NetPoints=('PnL Points', 'sum'),
+                AvgReturnPct=('Return %', 'mean'),
+                CumReturnPct=('Return %', 'sum')
+            )
+        )
+    else:
+        monthly_stats = pd.DataFrame()
 
     summary = {
         "total_trades": total_trades,
@@ -328,7 +355,7 @@ st.title("📈 Nikhil's Fyers MA/EMA Crossover Backtester")
 
 st.sidebar.header("Data & Strategy Settings")
 
-# ---------- Data selection (same base as your original app) ----------
+# ---------- Segment / Symbol selection ----------
 segment = st.sidebar.selectbox("Segment", [
     "Index", "Equity", "Equity Futures", "Equity Options (Monthly Expiry)",
     "Equity Options (Weekly Expiry)", "Currency Futures", "Currency Options (Monthly Expiry)",
@@ -339,29 +366,48 @@ exchange = st.sidebar.selectbox("Exchange", ["NSE", "BSE", "MCX", "CDS", "NFO"])
 symbol = st.sidebar.text_input("Symbol", value="NIFTY")
 
 year, month, day, strike, opt_type = None, None, None, None, None
+
 if segment not in ["Index", "Equity"]:
-    year = st.sidebar.selectbox("Year", list(range(2017, dt.date.today().year + 2)), index=5)
+    years = list(range(2017, dt.date.today().year + 2))
+    year = st.sidebar.selectbox("Year", years, index=len(years)-1)
+
     month = st.sidebar.selectbox("Month", [
         "JAN", "FEB", "MAR", "APR", "MAY", "JUN",
         "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"
     ], index=dt.date.today().month - 1)
+
     if "Weekly" in segment:
         day = st.sidebar.number_input("Day", min_value=1, max_value=31, value=dt.date.today().day)
+
     if "Options" in segment:
         strike = st.sidebar.text_input("Strike Price", value="")
         opt_type = st.sidebar.selectbox("Option Type", ["", "CE", "PE"])
 else:
-    st.sidebar.markdown("**Note:** No expiry/strike required for selected segment.")
+    st.sidebar.markdown("**Note:** No expiry/strike required for this segment.")
 
+# ---------- Date range & resolution ----------
 min_date = dt.date(2017, 7, 3)
 max_date = dt.date.today()
-start_date = st.sidebar.date_input("Start Date", value=max_date - dt.timedelta(days=30),
-                                   min_value=min_date, max_value=max_date)
-end_date = st.sidebar.date_input("End Date", value=max_date,
-                                 min_value=min_date, max_value=max_date)
-resolution = st.sidebar.selectbox("Resolution (Timeframe)", options=[
-    "1", "2", "3", "5", "10", "15", "20", "30", "60", "120", "240", "D"
-], index=9)
+
+start_date = st.sidebar.date_input(
+    "Start Date",
+    value=max_date - dt.timedelta(days=30),
+    min_value=min_date,
+    max_value=max_date
+)
+
+end_date = st.sidebar.date_input(
+    "End Date",
+    value=max_date,
+    min_value=min_date,
+    max_value=max_date
+)
+
+resolution = st.sidebar.selectbox(
+    "Resolution (Timeframe)",
+    options=["1", "2", "3", "5", "10", "15", "20", "30", "60", "120", "240", "D"],
+    index=9  # default "60"
+)
 
 # ---------- Strategy settings ----------
 st.sidebar.markdown("---")
@@ -369,14 +415,14 @@ st.sidebar.subheader("Strategy: MA/EMA Crossover")
 
 ma_type = st.sidebar.selectbox("MA Type", ["SMA", "EMA"])
 
-# Dropdowns for fast & slow period
 period_options = [5, 8, 9, 10, 13, 20, 21, 34, 50, 100, 200]
 fast_period = st.sidebar.selectbox("Fast MA Period", period_options, index=2)
 slow_period = st.sidebar.selectbox("Slow MA Period", period_options, index=6)
 
 if slow_period <= fast_period:
-    st.sidebar.warning("Slow period should be greater than fast period for meaningful crossover.")
+    st.sidebar.warning("Slow period should be greater than fast period for a proper crossover.")
 
+# ---------- Target / SL ----------
 st.sidebar.markdown("---")
 st.sidebar.subheader("Target & Stop Loss")
 
@@ -393,28 +439,29 @@ run_button = st.sidebar.button("🚀 Run Backtest")
 col1, col2 = st.columns([2, 1])
 
 with col1:
-    st.subheader("Historical Data & Signals")
+    st.subheader("Historical Data & Moving Averages")
 
 with col2:
     st.subheader("Backtest Summary")
 
+# ---------- Validate date ----------
 if start_date > end_date:
     st.error("⚠️ Start date must not be after end date.")
 else:
     fyers_symbol = build_fyers_symbol(segment, exchange, symbol, year, month, day, strike, opt_type)
 
     if run_button:
-        with st.spinner(f"Fetching data and running backtest for {fyers_symbol}..."):
+        with st.spinner(f"Fetching data & running backtest for {fyers_symbol}..."):
             data = fetch_data(fyers_symbol, start_date, end_date, resolution)
 
             if data.empty:
-                st.error("No data received. Check your inputs or try another range.")
+                st.error("No data received. Try different dates / symbol / resolution.")
             else:
-                # Only use OHLC for the strategy
                 price_df = data[['Open', 'High', 'Low', 'Close']].copy()
 
                 trades_df, summary = backtest_ma_crossover(
                     price_df,
+                    resolution=resolution,
                     ma_type=ma_type,
                     fast_period=fast_period,
                     slow_period=slow_period,
@@ -424,16 +471,16 @@ else:
                     tp_value=tp_value,
                 )
 
-                # ----- Left: show price + MA preview -----
+                # ---------- Left: data + MA preview ----------
                 with col1:
                     st.success("✅ Data fetched & backtest completed.")
-                    preview_df = add_moving_averages(price_df, ma_type, fast_period, slow_period)
+                    ma_df = add_moving_averages(price_df, ma_type, fast_period, slow_period)
                     st.write("Last 50 candles with MAs:")
-                    st.dataframe(preview_df[['Open', 'High', 'Low', 'Close', 'fast_ma', 'slow_ma']].tail(50))
+                    st.dataframe(ma_df[['Open', 'High', 'Low', 'Close', 'fast_ma', 'slow_ma']].tail(50))
 
-                    st.line_chart(preview_df[['Close', 'fast_ma', 'slow_ma']].tail(500))
+                    st.line_chart(ma_df[['Close', 'fast_ma', 'slow_ma']].tail(500))
 
-                # ----- Right: summary metrics -----
+                # ---------- Right: summary ----------
                 with col2:
                     if trades_df.empty:
                         st.warning("No trades generated with the selected parameters.")
@@ -443,10 +490,10 @@ else:
                         st.metric("Loss-making Trades", summary["losses"])
                         st.metric("Win Rate (%)", f"{summary['win_rate']:.2f}")
                         st.metric("Net PnL (Points)", f"{summary['net_points']:.2f}")
-                        st.metric("Avg Return per Trade (%)", f"{summary['avg_return']:.2f}")
+                        st.metric("Avg Return / Trade (%)", f"{summary['avg_return']:.2f}")
                         st.metric("Cumulative Return (%)", f"{summary['cum_return']:.2f}")
 
-                # ----- Full details below -----
+                # ---------- Detailed section ----------
                 st.markdown("---")
                 st.subheader("📊 Trades Details")
 
@@ -464,13 +511,11 @@ else:
                     monthly_stats = summary.get("monthly_stats")
                     if monthly_stats is not None and not monthly_stats.empty:
                         st.dataframe(monthly_stats)
-                        st.bar_chart(
-                            monthly_stats.set_index("Month")[["NetPoints"]]
-                        )
+
+                        # Bar chart of NetPoints per month
+                        ms_chart = monthly_stats.set_index("Month")[["NetPoints"]]
+                        st.bar_chart(ms_chart)
                     else:
-                        st.info("No monthly stats (no trades).")
+                        st.info("No monthly stats available (no trades).")
     else:
         st.info("Set your parameters on the left and click **Run Backtest** to start.")
-
-
-
