@@ -4,12 +4,14 @@ import pandas as pd
 import numpy as np
 import datetime as dt
 import altair as alt
+import calendar
 
 # ========================= FYERS SETUP =========================
+# access.txt must contain your access token string
 with open('access.txt', 'r') as a:
     access_token = a.read().strip()
 
-client_id = 'KB4YGO9V7J-100'   # change if needed
+client_id = 'KB4YGO9V7-100'   # <-- change to your client id if needed
 fyers = fyersModel.FyersModel(client_id=client_id, is_async=False, token=access_token, log_path="")
 
 NIFTY_SYMBOL = "NSE:NIFTY50-INDEX"  # Benchmark
@@ -31,6 +33,38 @@ def build_fyers_symbol(segment, exchange, symbol, year=None, month=None, day=Non
         return f"{exchange}:{symbol}{str(year)[-2:]}{month.upper()}{day:02d}{strike}{opt_type}"
     else:
         raise ValueError("Unsupported segment type")
+
+
+# ---------- Helper: current / next month futures for index live trading ----------
+def last_thursday(year: int, month: int) -> dt.date:
+    cal = calendar.monthcalendar(year, month)
+    thursdays = [week[calendar.THURSDAY] for week in cal if week[calendar.THURSDAY] != 0]
+    return dt.date(year, month, thursdays[-1])
+
+
+def current_month_future_symbol(underlying: str, exchange: str = "NFO", as_of: dt.date | None = None) -> str:
+    """
+    For Index backtests, live execution will happen on current-month futures:
+    e.g. NFO:NIFTY24NOVFUT. If today is after expiry, move to next month.
+    """
+    if as_of is None:
+        as_of = dt.date.today()
+
+    year = as_of.year
+    month = as_of.month
+    exp = last_thursday(year, month)
+    if as_of > exp:  # after expiry → next month
+        if month == 12:
+            year += 1
+            month = 1
+        else:
+            month += 1
+        exp = last_thursday(year, month)
+
+    month_code = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+                  "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"][month - 1]
+    yy = str(year)[-2:]
+    return f"{exchange}:{underlying}{yy}{month_code}FUT"
 
 
 # =================== HISTORICAL DATA FETCH =====================
@@ -338,8 +372,8 @@ def add_costs_and_equity(trades_df, qty, slip_pts_side, broker_rs_side, initial_
     df['Qty'] = qty
     df['GrossPoints'] = df['PnL Points']
     df['GrossPnlRs'] = df['GrossPoints'] * df['Qty']
-    df['SlippageRs'] = slip_pts_side * 2 * df['Qty']
-    df['BrokerageRs'] = broker_rs_side * 2
+    df['SlippageRs'] = slip_pts_side * 2 * df['Qty']   # in/out
+    df['BrokerageRs'] = broker_rs_side * 2             # in/out
     df['NetPnlRs'] = df['GrossPnlRs'] - df['SlippageRs'] - df['BrokerageRs']
     df['CumNetPnlRs'] = df['NetPnlRs'].cumsum()
     df['Equity'] = initial_capital + df['CumNetPnlRs']
@@ -399,7 +433,6 @@ def compute_overall_summary(trades_df, initial_capital):
     net_pnl_rs_total = trades_df['NetPnlRs'].sum()
     end_equity = trades_df['Equity'].iloc[-1]
     cum_return_pct = (end_equity / initial_capital - 1.0) * 100.0
-
     avg_return_pct = trades_df['Return %'].mean()
 
     trades_df['Month'] = trades_df['Entry Time'].dt.to_period('M').astype(str)
@@ -432,7 +465,7 @@ def compute_overall_summary(trades_df, initial_capital):
     return summary
 
 
-def side_summary(trades_df, initial_capital, side):
+def side_summary(trades_df, side):
     df = trades_df[trades_df['Direction'] == side].copy()
     if df.empty:
         return None
@@ -463,6 +496,53 @@ def build_calendar_df(daily):
     return cal
 
 
+# ====================== LIVE TRADING HELPERS ===================
+def latest_strategy_signal(df, ma_type, fast_period, slow_period):
+    """
+    Return 'long', 'short' or None based on the last crossover on df.
+    """
+    df_ma = add_moving_averages(df.copy(), ma_type, fast_period, slow_period)
+    if len(df_ma) < 2:
+        return None
+
+    last = df_ma.iloc[-1]
+    prev = df_ma.iloc[-2]
+
+    if last['fast_ma'] > last['slow_ma'] and prev['fast_ma'] <= prev['slow_ma']:
+        return "long"
+    if last['fast_ma'] < last['slow_ma'] and prev['fast_ma'] >= prev['slow_ma']:
+        return "short"
+    return None
+
+
+def place_market_order_fyers(symbol: str, side: str, qty: int, product_type: str = "INTRADAY"):
+    """
+    Place a simple market order via Fyers.
+    side: 'BUY' or 'SELL'
+    product_type: 'INTRADAY', 'MARGIN', etc.
+    """
+    side_val = 1 if side == "BUY" else -1
+    order_data = {
+        "symbol": symbol,
+        "qty": qty,
+        "type": 2,           # 2 = MARKET
+        "side": side_val,    # 1 = Buy, -1 = Sell
+        "productType": product_type,
+        "limitPrice": 0,
+        "stopPrice": 0,
+        "validity": "DAY",
+        "disclosedQty": 0,
+        "offlineOrder": False,
+        "stopLoss": 0,
+        "takeProfit": 0
+    }
+    try:
+        resp = fyers.place_order(order_data)
+        return resp
+    except Exception as e:
+        return {"s": "error", "message": str(e)}
+
+
 # ======================= STREAMLIT UI ==========================
 st.set_page_config(page_title="Nikhil's Fyers Backtester", layout="wide")
 st.title("📈 Nikhil's Fyers MA/EMA Crossover Backtester")
@@ -477,7 +557,7 @@ segment = st.sidebar.selectbox("Segment", [
 ])
 
 exchange = st.sidebar.selectbox("Exchange", ["NSE", "BSE", "MCX", "CDS", "NFO"])
-symbol = st.sidebar.text_input("Symbol", value="NIFTY")
+symbol = st.sidebar.text_input("Symbol", value="NIFTY50")
 
 year, month, day, strike, opt_type = None, None, None, None, None
 if segment not in ["Index", "Equity"]:
@@ -614,7 +694,6 @@ else:
                         nifty_first = nifty_data['Close'].iloc[0]
                         nifty_last = nifty_data['Close'].iloc[-1]
                         nifty_ret_pct = (nifty_last / nifty_first - 1.0) * 100.0
-                        # Convert gross points result to % of NIFTY start
                         strat_vs_nifty_pct = (overall['gross_points_total'] / nifty_first) * 100.0
 
                     # ===== KPI SECTION =====
@@ -660,8 +739,8 @@ else:
 
                     # Long vs Short stats for Combined
                     if trade_side == "Long & Short":
-                        long_summary = side_summary(trades_df, initial_capital, "long")
-                        short_summary = side_summary(trades_df, initial_capital, "short")
+                        long_summary = side_summary(trades_df, "long")
+                        short_summary = side_summary(trades_df, "short")
 
                         st.markdown("### 🔁 Long vs Short Breakdown")
                         c1, c2 = st.columns(2)
@@ -902,5 +981,82 @@ else:
                         file_name=f"{symbol}_MA_Backtest_Trades.csv",
                         mime="text/csv"
                     )
+
+                    # ==================== LIVE DEPLOYMENT ====================
+                    st.markdown("---")
+                    st.markdown("## ⚡ Live Deployment to Fyers (Use with Caution)")
+                    st.caption(
+                        "Index backtests will execute on current-month futures (e.g. NFO:NIFTYxxMONFUT). "
+                        "Verify everything in paper / small size first."
+                    )
+
+                    live_enable = st.checkbox("Enable live order section")
+
+                    if live_enable:
+                        live_col1, live_col2 = st.columns(2)
+                        with live_col1:
+                            live_mode = st.radio(
+                                "Live Action",
+                                ["Use Strategy Signal (latest MA crossover)", "Manual BUY", "Manual SELL"],
+                                index=0
+                            )
+                        with live_col2:
+                            live_qty = st.number_input(
+                                "Live Quantity", min_value=1, value=quantity, step=1
+                            )
+                            live_product = st.selectbox(
+                                "Product Type", ["INTRADAY", "MARGIN"], index=0
+                            )
+
+                        # Determine live trading symbol
+                        if segment == "Index":
+                            live_symbol = current_month_future_symbol(symbol.replace("NIFTY50", "NIFTY").replace("BANKNIFTY", "BANKNIFTY"))
+                        else:
+                            live_symbol = fyers_symbol
+
+                        st.write(f"Live trading symbol will be: **{live_symbol}**")
+
+                        if st.button("✅ Place Live Order Now"):
+                            side = None
+                            if live_mode == "Manual BUY":
+                                side = "BUY"
+                            elif live_mode == "Manual SELL":
+                                side = "SELL"
+                            else:
+                                # Use latest MA crossover signal
+                                latest_data = fetch_data(
+                                    fyers_symbol,
+                                    dt.date.today() - dt.timedelta(days=5),
+                                    dt.date.today(),
+                                    resolution
+                                )
+                                if latest_data.empty:
+                                    st.error("Could not fetch recent data for live signal.")
+                                else:
+                                    last_ma_signal = latest_strategy_signal(
+                                        latest_data[['Open', 'High', 'Low', 'Close']],
+                                        ma_type,
+                                        fast_period,
+                                        slow_period
+                                    )
+                                    if last_ma_signal is None:
+                                        st.warning("No fresh crossover signal on latest data. No order placed.")
+                                    else:
+                                        if last_ma_signal == "long" and trade_side in ["Long Only", "Long & Short"]:
+                                            side = "BUY"
+                                        elif last_ma_signal == "short" and trade_side in ["Short Only", "Long & Short"]:
+                                            side = "SELL"
+                                        else:
+                                            st.warning(
+                                                f"Latest signal is '{last_ma_signal}', "
+                                                f"but trade side is '{trade_side}'. No order placed."
+                                            )
+
+                            if side is not None:
+                                st.info(f"Placing {side} market order for {live_qty} on {live_symbol} via Fyers...")
+                                resp = place_market_order_fyers(live_symbol, side, live_qty, live_product)
+                                st.write("Fyers response:", resp)
+                            else:
+                                st.info("No valid side determined. Order not sent.")
     else:
         st.info("Set parameters on the left and click **Run Backtest**.")
