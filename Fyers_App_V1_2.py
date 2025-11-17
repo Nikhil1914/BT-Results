@@ -6,18 +6,17 @@ import datetime as dt
 import altair as alt
 
 # ========================= FYERS SETUP =========================
-# Make sure 'access.txt' exists and contains your access token
 with open('access.txt', 'r') as a:
     access_token = a.read().strip()
 
 client_id = 'KB4YGO9V7J-100'   # change if needed
 fyers = fyersModel.FyersModel(client_id=client_id, is_async=False, token=access_token, log_path="")
 
+NIFTY_SYMBOL = "NSE:NIFTY50-INDEX"  # Benchmark
+
+
 # ==================== SYMBOL BUILD FUNCTION ====================
 def build_fyers_symbol(segment, exchange, symbol, year=None, month=None, day=None, strike=None, opt_type=None):
-    """
-    Builds Fyers symbol string based on segment / exchange / expiry / strike etc.
-    """
     if segment == "Equity":
         return f"{exchange}:{symbol}-EQ"
     elif segment == "Index":
@@ -33,12 +32,9 @@ def build_fyers_symbol(segment, exchange, symbol, year=None, month=None, day=Non
     else:
         raise ValueError("Unsupported segment type")
 
+
 # =================== HISTORICAL DATA FETCH =====================
 def fetch_data(symbol, start_date, end_date, resolution="60"):
-    """
-    Fetch data from Fyers API in chunks and return a OHLCV(+OI) DataFrame indexed by Date.
-    Date is converted to IST and timezone removed.
-    """
     df = pd.DataFrame()
 
     resolution_minutes = {
@@ -46,7 +42,6 @@ def fetch_data(symbol, start_date, end_date, resolution="60"):
         "20": 20, "30": 30, "60": 60, "120": 120, "240": 240
     }
 
-    # Decide chunk size
     if resolution in resolution_minutes:
         chunk_days = 100       # intraday
     elif resolution in ["D", "1D"]:
@@ -74,20 +69,23 @@ def fetch_data(symbol, start_date, end_date, resolution="60"):
         try:
             response = fyers.history(params)
             if 'candles' in response and response['candles']:
-                first_candle_len = len(response['candles'][0])
-                if first_candle_len == 7:
-                    chunk = pd.DataFrame(response['candles'],
-                                         columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
-                elif first_candle_len == 6:
-                    chunk = pd.DataFrame(response['candles'],
-                                         columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume'])
+                first_len = len(response['candles'][0])
+                if first_len == 7:
+                    chunk = pd.DataFrame(
+                        response['candles'],
+                        columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI']
+                    )
+                elif first_len == 6:
+                    chunk = pd.DataFrame(
+                        response['candles'],
+                        columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
+                    )
                     chunk['OI'] = None
                 else:
                     st.error(f"Unexpected candle format from {current_start} to {current_end}")
                     current_start = current_end + dt.timedelta(days=1)
                     continue
 
-                # Convert timestamp to IST and drop tz
                 chunk['Date'] = pd.to_datetime(chunk['Date'], unit='s')
                 chunk['Date'] = (
                     chunk['Date']
@@ -97,7 +95,6 @@ def fetch_data(symbol, start_date, end_date, resolution="60"):
                 )
                 chunk = chunk.set_index('Date')
                 chunk['Symbol'] = symbol
-
                 df = pd.concat([df, chunk])
         except Exception as e:
             st.error(f"Error from {current_start} to {current_end}: {e}")
@@ -107,13 +104,9 @@ def fetch_data(symbol, start_date, end_date, resolution="60"):
     df = df[~df.index.duplicated(keep='first')]
     return df
 
-# ===================== INDICATOR FUNCTIONS =====================
 
+# ===================== INDICATOR FUNCTIONS =====================
 def add_moving_averages(df, ma_type, fast_period, slow_period):
-    """
-    Adds fast_ma and slow_ma columns (SMA or EMA) and generates entry/exit 'signal'.
-    signal = 1 => bullish crossover, signal = -1 => bearish crossover.
-    """
     df = df.copy()
     price = df['Close']
 
@@ -135,14 +128,12 @@ def add_moving_averages(df, ma_type, fast_period, slow_period):
         (df['fast_ma'] < df['slow_ma']) &
         (df['fast_ma'].shift(1) >= df['slow_ma'].shift(1)),
         'signal'
-    ] = -1  # Bearish (used for exit logic if needed)
+    ] = -1  # Bearish crossover
 
     return df
 
+
 def calc_level(entry_price, level_type, level_value, direction="long"):
-    """
-    Calculates TP & SL price based on points or percent.
-    """
     if level_type == "Points":
         if direction == "long":
             tp_price = entry_price + level_value
@@ -159,8 +150,13 @@ def calc_level(entry_price, level_type, level_value, direction="long"):
             sl_price = entry_price * (1 + level_value / 100.0)
     return tp_price, sl_price
 
-# ===================== BACKTESTING LOGIC =======================
 
+def compute_pnl_points(direction, entry_price, exit_price):
+    """Positive points = profitable, for both long & short."""
+    return exit_price - entry_price if direction == "long" else entry_price - exit_price
+
+
+# ===================== BACKTESTING LOGIC =======================
 def backtest_ma_crossover(
     df,
     resolution,
@@ -171,36 +167,26 @@ def backtest_ma_crossover(
     sl_value=50.0,
     tp_type="Points",
     tp_value=100.0,
-    trade_mode="Intraday",  # <-- NEW
+    trade_mode="Intraday",      # Intraday / Positional
+    trade_side="Long Only",     # Long Only / Short Only / Long & Short
 ):
-    """
-    Long-only MA/EMA crossover backtest.
-
-    trade_mode:
-        - "Intraday": exit by 14:55 each day, no overnight.
-        - "Positional": keep across days, exit only at TP/SL
-                        (or final bar of backtest).
-    """
     if df.empty:
-        return pd.DataFrame(), {}
+        return pd.DataFrame()
 
-    df = df.copy()
-    df = df.sort_index()
+    df = df.copy().sort_index()
 
-    # Intraday filter only if intraday resolution (both modes)
     intraday_resolutions = {"1", "2", "3", "5", "10", "15", "20", "30", "60", "120", "240"}
     if resolution in intraday_resolutions:
         df = df.between_time("09:15", "15:30")
 
     if df.empty:
-        return pd.DataFrame(), {}
+        return pd.DataFrame()
 
-    # Indicators and signals
     df = add_moving_averages(df, ma_type, fast_period, slow_period)
 
     trades = []
     in_trade = False
-    direction = "long"
+    direction = None
     entry_price = None
     entry_time = None
     tp_price = None
@@ -216,12 +202,11 @@ def backtest_ma_crossover(
         prev_ts = df.index[i - 1]
         signal_prev = prev_row['signal']
 
-        # ---------- FORCED EXIT ON DAY CHANGE ----------
-        # Only in INTRADAY mode (no overnight)
+        # ----- Exit on day change (Intraday only) -----
         if in_trade and trade_mode == "Intraday" and ts.date() != trade_date:
             exit_price = prev_row['Close']
             exit_time = prev_ts
-            pnl_points = exit_price - entry_price
+            pnl_points = compute_pnl_points(direction, entry_price, exit_price)
             trades.append({
                 "Entry Time": entry_time,
                 "Exit Time": exit_time,
@@ -229,14 +214,13 @@ def backtest_ma_crossover(
                 "Entry Price": entry_price,
                 "Exit Price": exit_price,
                 "PnL Points": pnl_points,
-                "Return %": (pnl_points / entry_price) * 100.0,
                 "Exit Reason": "EOD (day change)",
                 "Entry Date": entry_time.date()
             })
             in_trade = False
-            entry_price = entry_time = tp_price = sl_price = trade_date = None
+            entry_price = entry_time = tp_price = sl_price = trade_date = direction = None
 
-        # ---------- MANAGE OPEN TRADE: SL / TP ----------
+        # ----- Manage open trade: TP / SL -----
         if in_trade:
             bar_high = row['High']
             bar_low = row['Low']
@@ -244,44 +228,26 @@ def backtest_ma_crossover(
             if direction == "long":
                 hit_tp = bar_high >= tp_price
                 hit_sl = bar_low <= sl_price
+            else:  # short
+                hit_tp = bar_low <= tp_price
+                hit_sl = bar_high >= sl_price
 
-                if hit_sl and hit_tp:
-                    exit_price = sl_price
-                    exit_reason = "SL&TP same bar (SL priority)"
-                elif hit_tp:
-                    exit_price = tp_price
-                    exit_reason = "Target"
-                elif hit_sl:
-                    exit_price = sl_price
-                    exit_reason = "Stop Loss"
-                else:
-                    exit_price = None
-                    exit_reason = None
+            if hit_sl and hit_tp:
+                exit_price = sl_price
+                exit_reason = "SL&TP same bar (SL priority)"
+            elif hit_tp:
+                exit_price = tp_price
+                exit_reason = "Target"
+            elif hit_sl:
+                exit_price = sl_price
+                exit_reason = "Stop Loss"
+            else:
+                exit_price = None
+                exit_reason = None
 
-                if exit_price is not None:
-                    exit_time = ts
-                    pnl_points = exit_price - entry_price
-                    trades.append({
-                        "Entry Time": entry_time,
-                        "Exit Time": exit_time,
-                        "Direction": direction,
-                        "Entry Price": entry_price,
-                        "Exit Price": exit_price,
-                        "PnL Points": pnl_points,
-                        "Return %": (pnl_points / entry_price) * 100.0,
-                        "Exit Reason": exit_reason,
-                        "Entry Date": entry_time.date()
-                    })
-                    in_trade = False
-                    entry_price = entry_time = tp_price = sl_price = trade_date = None
-                    continue  # move to next candle
-
-        # ---------- INTRADAY EOD EXIT AT 14:55 ----------
-        if in_trade and trade_mode == "Intraday":
-            if ts.time() >= intraday_exit_time and ts.date() == trade_date:
-                exit_price = row['Close']
+            if exit_price is not None:
                 exit_time = ts
-                pnl_points = exit_price - entry_price
+                pnl_points = compute_pnl_points(direction, entry_price, exit_price)
                 trades.append({
                     "Entry Time": entry_time,
                     "Exit Time": exit_time,
@@ -289,30 +255,60 @@ def backtest_ma_crossover(
                     "Entry Price": entry_price,
                     "Exit Price": exit_price,
                     "PnL Points": pnl_points,
-                    "Return %": (pnl_points / entry_price) * 100.0,
+                    "Exit Reason": exit_reason,
+                    "Entry Date": entry_time.date()
+                })
+                in_trade = False
+                entry_price = entry_time = tp_price = sl_price = trade_date = direction = None
+                continue
+
+        # ----- Intraday forced exit at 14:55 -----
+        if in_trade and trade_mode == "Intraday":
+            if ts.time() >= intraday_exit_time and ts.date() == trade_date:
+                exit_price = row['Close']
+                exit_time = ts
+                pnl_points = compute_pnl_points(direction, entry_price, exit_price)
+                trades.append({
+                    "Entry Time": entry_time,
+                    "Exit Time": exit_time,
+                    "Direction": direction,
+                    "Entry Price": entry_price,
+                    "Exit Price": exit_price,
+                    "PnL Points": pnl_points,
                     "Exit Reason": "Intraday EOD 14:55",
                     "Entry Date": entry_time.date()
                 })
                 in_trade = False
-                entry_price = entry_time = tp_price = sl_price = trade_date = None
+                entry_price = entry_time = tp_price = sl_price = trade_date = direction = None
                 continue
 
-        # ---------- NEW ENTRY ----------
-        if (not in_trade) and (signal_prev == 1):
-            entry_price = row['Open']
-            entry_time = ts
-            trade_date = ts.date()
-            direction = "long"
-            tp_price, sl_price = calc_level(entry_price, tp_type, tp_value, direction)
-            in_trade = True
+        # ----- New entry -----
+        if not in_trade:
+            # Long entries
+            if trade_side in ["Long Only", "Long & Short"] and signal_prev == 1:
+                direction = "long"
+                entry_price = row['Open']
+                entry_time = ts
+                trade_date = ts.date()
+                tp_price, sl_price = calc_level(entry_price, tp_type, tp_value, direction)
+                in_trade = True
 
-    # ---------- FINAL OPEN TRADE EXIT (end of data) ----------
+            # Short entries
+            elif trade_side in ["Short Only", "Long & Short"] and signal_prev == -1:
+                direction = "short"
+                entry_price = row['Open']
+                entry_time = ts
+                trade_date = ts.date()
+                tp_price, sl_price = calc_level(entry_price, tp_type, tp_value, direction)
+                in_trade = True
+
+    # ----- Final open trade exit -----
     if in_trade:
         last_row = df.iloc[-1]
         last_ts = df.index[-1]
         exit_price = last_row['Close']
         exit_time = last_ts
-        pnl_points = exit_price - entry_price
+        pnl_points = compute_pnl_points(direction, entry_price, exit_price)
         reason = "EOD (last bar)" if trade_mode == "Intraday" else "Backtest end"
         trades.append({
             "Entry Time": entry_time,
@@ -321,43 +317,104 @@ def backtest_ma_crossover(
             "Entry Price": entry_price,
             "Exit Price": exit_price,
             "PnL Points": pnl_points,
-            "Return %": (pnl_points / entry_price) * 100.0,
             "Exit Reason": reason,
             "Entry Date": entry_time.date()
         })
 
     if len(trades) == 0:
-        return pd.DataFrame(), {}
+        return pd.DataFrame()
 
     trades_df = pd.DataFrame(trades)
     trades_df['Entry Time'] = pd.to_datetime(trades_df['Entry Time'])
     trades_df['Exit Time'] = pd.to_datetime(trades_df['Exit Time'])
+    trades_df['Return %'] = (trades_df['PnL Points'] / trades_df['Entry Price']) * 100.0
 
-    # ---------- Summary stats ----------
+    return trades_df
+
+
+# ================= COSTS, CAPITAL & SUMMARY ====================
+def add_costs_and_equity(trades_df, qty, slip_pts_side, broker_rs_side, initial_capital):
+    df = trades_df.copy()
+    df['Qty'] = qty
+    df['GrossPoints'] = df['PnL Points']
+    df['GrossPnlRs'] = df['GrossPoints'] * df['Qty']
+    df['SlippageRs'] = slip_pts_side * 2 * df['Qty']
+    df['BrokerageRs'] = broker_rs_side * 2
+    df['NetPnlRs'] = df['GrossPnlRs'] - df['SlippageRs'] - df['BrokerageRs']
+    df['CumNetPnlRs'] = df['NetPnlRs'].cumsum()
+    df['Equity'] = initial_capital + df['CumNetPnlRs']
+    return df
+
+
+def build_daily_stats(trades_df, initial_capital):
+    daily = (
+        trades_df
+        .groupby('Entry Date', as_index=False)
+        .agg(
+            GrossPoints=('GrossPoints', 'sum'),
+            NetPnlRs=('NetPnlRs', 'sum'),
+            Trades=('NetPnlRs', 'count')
+        )
+        .rename(columns={'Entry Date': 'Date'})
+    )
+
+    daily['Date'] = pd.to_datetime(daily['Date'])
+    daily = daily.sort_values('Date').reset_index(drop=True)
+
+    daily['CumNetPnlRs'] = daily['NetPnlRs'].cumsum()
+    daily['Equity'] = initial_capital + daily['CumNetPnlRs']
+    daily['PeakEquity'] = daily['Equity'].cummax()
+    daily['DrawdownRs'] = daily['Equity'] - daily['PeakEquity']
+
+    return daily
+
+
+def compute_risk_stats(daily):
+    if daily.empty:
+        return {}
+
+    best_day = daily.loc[daily['NetPnlRs'].idxmax()]
+    worst_day = daily.loc[daily['NetPnlRs'].idxmin()]
+    max_dd = daily['DrawdownRs'].min()
+    avg_daily = daily['NetPnlRs'].mean()
+
+    return {
+        "best_day_date": best_day['Date'].date(),
+        "best_day_pnl": best_day['NetPnlRs'],
+        "worst_day_date": worst_day['Date'].date(),
+        "worst_day_pnl": worst_day['NetPnlRs'],
+        "max_drawdown": max_dd,
+        "avg_daily_pnl": avg_daily,
+    }
+
+
+def compute_overall_summary(trades_df, initial_capital):
     total_trades = len(trades_df)
-    wins = (trades_df['PnL Points'] > 0).sum()
-    losses = (trades_df['PnL Points'] < 0).sum()
-    breakeven = (trades_df['PnL Points'] == 0).sum()
+    wins = (trades_df['NetPnlRs'] > 0).sum()
+    losses = (trades_df['NetPnlRs'] < 0).sum()
+    breakeven = (trades_df['NetPnlRs'] == 0).sum()
     win_rate = (wins / total_trades) * 100.0 if total_trades > 0 else 0.0
-    net_points = trades_df['PnL Points'].sum()
-    avg_return = trades_df['Return %'].mean()
-    cum_return = trades_df['Return %'].sum()
 
-    # ---------- Monthly stats ----------
+    gross_points_total = trades_df['GrossPoints'].sum()
+    net_pnl_rs_total = trades_df['NetPnlRs'].sum()
+    end_equity = trades_df['Equity'].iloc[-1]
+    cum_return_pct = (end_equity / initial_capital - 1.0) * 100.0
+
+    avg_return_pct = trades_df['Return %'].mean()
+
     trades_df['Month'] = trades_df['Entry Time'].dt.to_period('M').astype(str)
-    monthly_stats = (
+    monthly = (
         trades_df
         .groupby('Month', as_index=False)
         .agg(
-            Trades=('PnL Points', 'count'),
-            Wins=('PnL Points', lambda x: (x > 0).sum()),
-            Losses=('PnL Points', lambda x: (x < 0).sum()),
-            WinRatePct=('PnL Points', lambda x: (x > 0).mean() * 100.0),
-            NetPoints=('PnL Points', 'sum'),
-            AvgReturnPct=('Return %', 'mean'),
-            CumReturnPct=('Return %', 'sum')
+            Trades=('NetPnlRs', 'count'),
+            NetPnlRs=('NetPnlRs', 'sum'),
+            GrossPoints=('GrossPoints', 'sum'),
+            Wins=('NetPnlRs', lambda x: (x > 0).sum()),
+            Losses=('NetPnlRs', lambda x: (x < 0).sum())
         )
     )
+    monthly['WinRatePct'] = (monthly['Wins'] / monthly['Trades']) * 100.0
 
     summary = {
         "total_trades": total_trades,
@@ -365,69 +422,54 @@ def backtest_ma_crossover(
         "losses": losses,
         "breakeven": breakeven,
         "win_rate": win_rate,
-        "net_points": net_points,
-        "avg_return": avg_return,
-        "cum_return": cum_return,
-        "monthly_stats": monthly_stats
+        "gross_points_total": gross_points_total,
+        "net_pnl_rs_total": net_pnl_rs_total,
+        "avg_return_pct": avg_return_pct,
+        "cum_return_pct": cum_return_pct,
+        "monthly_stats": monthly,
+        "end_equity": end_equity,
     }
+    return summary
 
-    return trades_df, summary
 
-# ===================== ANALYTICS HELPERS =======================
-
-def build_daily_stats(trades_df):
-    """Aggregate to daily PnL and build equity & drawdown."""
-    daily = (
-        trades_df
-        .groupby('Entry Date', as_index=False)
-        .agg(PnLPoints=('PnL Points', 'sum'),
-             Trades=('PnL Points', 'count'))
-        .rename(columns={'Entry Date': 'Date'})
-    )
-    daily['Date'] = pd.to_datetime(daily['Date'])
-    daily = daily.sort_values('Date').reset_index(drop=True)
-
-    daily['CumPnL'] = daily['PnLPoints'].cumsum()
-    daily['Peak'] = daily['CumPnL'].cummax()
-    daily['Drawdown'] = daily['CumPnL'] - daily['Peak']
-
-    return daily
-
-def compute_risk_stats(daily):
-    """Basic risk stats like best/worst day and max DD."""
-    if daily.empty:
-        return {}
-
-    best_day = daily.loc[daily['PnLPoints'].idxmax()]
-    worst_day = daily.loc[daily['PnLPoints'].idxmin()]
-    max_dd = daily['Drawdown'].min()  # negative
-    avg_daily = daily['PnLPoints'].mean()
+def side_summary(trades_df, initial_capital, side):
+    df = trades_df[trades_df['Direction'] == side].copy()
+    if df.empty:
+        return None
+    total_trades = len(df)
+    wins = (df['NetPnlRs'] > 0).sum()
+    losses = (df['NetPnlRs'] < 0).sum()
+    breakeven = (df['NetPnlRs'] == 0).sum()
+    win_rate = (wins / total_trades) * 100.0 if total_trades > 0 else 0.0
+    net_pnl = df['NetPnlRs'].sum()
+    gross_points = df['GrossPoints'].sum()
 
     return {
-        "best_day_date": best_day['Date'].date(),
-        "best_day_pnl": best_day['PnLPoints'],
-        "worst_day_date": worst_day['Date'].date(),
-        "worst_day_pnl": worst_day['PnLPoints'],
-        "max_drawdown": max_dd,
-        "avg_daily_pnl": avg_daily,
+        "total_trades": total_trades,
+        "wins": wins,
+        "losses": losses,
+        "breakeven": breakeven,
+        "win_rate": win_rate,
+        "net_pnl": net_pnl,
+        "gross_points": gross_points,
     }
 
+
 def build_calendar_df(daily):
-    """Prepare data for a calendar-like heatmap using Altair."""
     cal = daily.copy()
     cal['Year'] = cal['Date'].dt.year
     cal['Month'] = cal['Date'].dt.month_name().str[:3]
     cal['Day'] = cal['Date'].dt.day
     return cal
 
-# ======================= STREAMLIT UI ==========================
 
+# ======================= STREAMLIT UI ==========================
 st.set_page_config(page_title="Nikhil's Fyers Backtester", layout="wide")
 st.title("📈 Nikhil's Fyers MA/EMA Crossover Backtester")
 
 st.sidebar.header("Data & Strategy Settings")
 
-# ---------- Segment / Symbol selection ----------
+# ---------- Segment / Symbol ----------
 segment = st.sidebar.selectbox("Segment", [
     "Index", "Equity", "Equity Futures", "Equity Options (Monthly Expiry)",
     "Equity Options (Weekly Expiry)", "Currency Futures", "Currency Options (Monthly Expiry)",
@@ -438,7 +480,6 @@ exchange = st.sidebar.selectbox("Exchange", ["NSE", "BSE", "MCX", "CDS", "NFO"])
 symbol = st.sidebar.text_input("Symbol", value="NIFTY")
 
 year, month, day, strike, opt_type = None, None, None, None, None
-
 if segment not in ["Index", "Equity"]:
     years = list(range(2017, dt.date.today().year + 2))
     year = st.sidebar.selectbox("Year", years, index=len(years)-1)
@@ -457,7 +498,7 @@ if segment not in ["Index", "Equity"]:
 else:
     st.sidebar.markdown("**Note:** No expiry/strike required for this segment.")
 
-# ---------- Date range & resolution ----------
+# ---------- Date & Resolution ----------
 min_date = dt.date(2017, 7, 3)
 max_date = dt.date.today()
 
@@ -478,10 +519,10 @@ end_date = st.sidebar.date_input(
 resolution = st.sidebar.selectbox(
     "Resolution (Timeframe)",
     options=["1", "2", "3", "5", "10", "15", "20", "30", "60", "120", "240", "D"],
-    index=9  # default "60"
+    index=9
 )
 
-# ---------- Strategy settings ----------
+# ---------- Strategy ----------
 st.sidebar.markdown("---")
 st.sidebar.subheader("Strategy: MA/EMA Crossover")
 
@@ -504,22 +545,30 @@ tp_value = st.sidebar.number_input(f"Target ({tp_type})", min_value=0.0, value=1
 sl_type = st.sidebar.selectbox("Stop Loss Type", ["Points", "Percent"], index=0)
 sl_value = st.sidebar.number_input(f"Stop Loss ({sl_type})", min_value=0.0, value=50.0, step=1.0)
 
-# ---------- NEW: Trade Mode ----------
+# ---------- Trade mode & side ----------
 st.sidebar.markdown("---")
 trade_mode = st.sidebar.radio("Trade Mode", ["Intraday", "Positional"], index=0)
+trade_side = st.sidebar.radio("Trade Side", ["Long Only", "Short Only", "Long & Short"], index=0)
+
+# ---------- Capital & Costs ----------
+st.sidebar.markdown("---")
+st.sidebar.subheader("Capital & Costs")
+
+initial_capital = st.sidebar.number_input("Initial Capital (₹)", min_value=0.0, value=100000.0, step=10000.0)
+quantity = st.sidebar.number_input("Quantity / Lot Size (per trade)", min_value=1, value=25, step=1)
+slippage_per_side = st.sidebar.number_input("Slippage per side (points)", min_value=0.0, value=0.5, step=0.05)
+brokerage_per_side = st.sidebar.number_input("Brokerage per side (₹)", min_value=0.0, value=20.0, step=1.0)
 
 st.sidebar.markdown("---")
 run_button = st.sidebar.button("🚀 Run Backtest")
 
-# ========================= MAIN LAYOUT =========================
-
-# Top info area
+# ========================= MAIN ================================
 if start_date > end_date:
     st.error("⚠️ Start date must not be after end date.")
 else:
     fyers_symbol = build_fyers_symbol(segment, exchange, symbol, year, month, day, strike, opt_type)
     st.caption(
-        f"Symbol: **{fyers_symbol}**  |  Date Range: {start_date} → {end_date}  |  TF: {resolution}  |  Mode: **{trade_mode}**"
+        f"Symbol: **{fyers_symbol}**  |  TF: {resolution}  |  Mode: **{trade_mode}**  |  Side: **{trade_side}**  |  {start_date} → {end_date}"
     )
 
     if run_button:
@@ -531,7 +580,7 @@ else:
             else:
                 price_df = data[['Open', 'High', 'Low', 'Close']].copy()
 
-                trades_df, summary = backtest_ma_crossover(
+                base_trades_df = backtest_ma_crossover(
                     price_df,
                     resolution=resolution,
                     ma_type=ma_type,
@@ -541,64 +590,122 @@ else:
                     sl_value=sl_value,
                     tp_type=tp_type,
                     tp_value=tp_value,
-                    trade_mode=trade_mode,   # <-- pass mode
+                    trade_mode=trade_mode,
+                    trade_side=trade_side,
                 )
 
-                if trades_df.empty:
+                if base_trades_df.empty:
                     st.warning("No trades generated with the selected parameters.")
                 else:
-                    # ======= KPI ROWS =======
-                    st.markdown("## 📊 Overview")
+                    trades_df = add_costs_and_equity(
+                        base_trades_df, quantity, slippage_per_side, brokerage_per_side, initial_capital
+                    )
 
-                    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-                    kpi1.metric("Total Trades", summary["total_trades"])
-                    kpi2.metric("Profitable Trades", summary["wins"])
-                    kpi3.metric("Loss-making Trades", summary["losses"])
-                    kpi4.metric("Win Rate (%)", f"{summary['win_rate']:.2f}")
-
-                    kpi5, kpi6, kpi7, kpi8 = st.columns(4)
-                    kpi5.metric("Net PnL (Points)", f"{summary['net_points']:.2f}")
-                    kpi6.metric("Avg Return / Trade (%)", f"{summary['avg_return']:.2f}")
-                    kpi7.metric("Cumulative Return (%)", f"{summary['cum_return']:.2f}")
-                    kpi8.metric("Breakeven Trades", summary["breakeven"])
-
-                    # Daily stats & risk
-                    daily_stats = build_daily_stats(trades_df)
+                    overall = compute_overall_summary(trades_df, initial_capital)
+                    daily_stats = build_daily_stats(trades_df, initial_capital)
                     risk = compute_risk_stats(daily_stats)
 
-                    kpi9, kpi10, kpi11, kpi12 = st.columns(4)
-                    if risk:
-                        kpi9.metric("Best Day PnL", f"{risk['best_day_pnl']:.2f}", str(risk['best_day_date']))
-                        kpi10.metric("Worst Day PnL", f"{risk['worst_day_pnl']:.2f}", str(risk['worst_day_date']))
-                        kpi11.metric("Max Drawdown (Points)", f"{risk['max_drawdown']:.2f}")
-                        kpi12.metric("Avg Daily PnL (Points)", f"{risk['avg_daily_pnl']:.2f}")
+                    # ===== NIFTY Benchmark =====
+                    nifty_data = fetch_data(NIFTY_SYMBOL, start_date, end_date, resolution)
+                    nifty_first = nifty_last = nifty_ret_pct = None
+                    strat_vs_nifty_pct = None
+
+                    if not nifty_data.empty:
+                        nifty_first = nifty_data['Close'].iloc[0]
+                        nifty_last = nifty_data['Close'].iloc[-1]
+                        nifty_ret_pct = (nifty_last / nifty_first - 1.0) * 100.0
+                        # Convert gross points result to % of NIFTY start
+                        strat_vs_nifty_pct = (overall['gross_points_total'] / nifty_first) * 100.0
+
+                    # ===== KPI SECTION =====
+                    st.markdown("## 📊 Overview")
+
+                    k1, k2, k3, k4 = st.columns(4)
+                    k1.metric("Total Trades", overall["total_trades"])
+                    k2.metric("Profitable Trades", overall["wins"])
+                    k3.metric("Loss-making Trades", overall["losses"])
+                    k4.metric("Win Rate (%)", f"{overall['win_rate']:.2f}")
+
+                    k5, k6, k7, k8 = st.columns(4)
+                    k5.metric("Gross PnL (Points)", f"{overall['gross_points_total']:.2f}")
+                    k6.metric("Net PnL (₹)", f"{overall['net_pnl_rs_total']:.2f}")
+                    k7.metric("Cumulative Return (%)", f"{overall['cum_return_pct']:.2f}")
+                    k8.metric("Avg Return / Trade (%)", f"{overall['avg_return_pct']:.2f}")
+
+                    # NIFTY comparison
+                    b1, b2, b3, b4 = st.columns(4)
+                    if nifty_ret_pct is not None:
+                        b1.metric("NIFTY50 Start", f"{nifty_first:.2f}")
+                        b2.metric("NIFTY50 End", f"{nifty_last:.2f}")
+                        b3.metric("NIFTY50 Return (%)", f"{nifty_ret_pct:.2f}")
+                        b4.metric("Strategy Gross Points as % of NIFTY Start", f"{strat_vs_nifty_pct:.2f}")
                     else:
-                        kpi9.metric("Best Day PnL", "–")
-                        kpi10.metric("Worst Day PnL", "–")
-                        kpi11.metric("Max Drawdown", "–")
-                        kpi12.metric("Avg Daily PnL", "–")
+                        b1.metric("NIFTY50 Return (%)", "N/A")
+                        b2.metric("Strategy vs NIFTY", "N/A")
+                        b3.metric("", "")
+                        b4.metric("", "")
+
+                    # Daily risk stats
+                    r1, r2, r3, r4 = st.columns(4)
+                    if risk:
+                        r1.metric("Best Day PnL (₹)", f"{risk['best_day_pnl']:.2f}", str(risk['best_day_date']))
+                        r2.metric("Worst Day PnL (₹)", f"{risk['worst_day_pnl']:.2f}", str(risk['worst_day_date']))
+                        r3.metric("Max Drawdown (₹)", f"{risk['max_drawdown']:.2f}")
+                        r4.metric("Avg Daily PnL (₹)", f"{risk['avg_daily_pnl']:.2f}")
+                    else:
+                        r1.metric("Best Day PnL", "–")
+                        r2.metric("Worst Day PnL", "–")
+                        r3.metric("Max Drawdown", "–")
+                        r4.metric("Avg Daily PnL", "–")
+
+                    # Long vs Short stats for Combined
+                    if trade_side == "Long & Short":
+                        long_summary = side_summary(trades_df, initial_capital, "long")
+                        short_summary = side_summary(trades_df, initial_capital, "short")
+
+                        st.markdown("### 🔁 Long vs Short Breakdown")
+                        c1, c2 = st.columns(2)
+
+                        with c1:
+                            st.markdown("**Long Trades**")
+                            if long_summary:
+                                st.metric("Trades", long_summary["total_trades"])
+                                st.metric("Win Rate (%)", f"{long_summary['win_rate']:.2f}")
+                                st.metric("Net PnL (₹)", f"{long_summary['net_pnl']:.2f}")
+                                st.metric("Gross Points", f"{long_summary['gross_points']:.2f}")
+                            else:
+                                st.write("No long trades.")
+
+                        with c2:
+                            st.markdown("**Short Trades**")
+                            if short_summary:
+                                st.metric("Trades", short_summary["total_trades"])
+                                st.metric("Win Rate (%)", f"{short_summary['win_rate']:.2f}")
+                                st.metric("Net PnL (₹)", f"{short_summary['net_pnl']:.2f}")
+                                st.metric("Gross Points", f"{short_summary['gross_points']:.2f}")
+                            else:
+                                st.write("No short trades.")
 
                     st.markdown("---")
 
-                    # ======= Calendar-style daily heatmap =======
-                    st.markdown("### 📅 Daily PnL Calendar Heatmap")
-
+                    # ===== Calendar Heatmap =====
+                    st.markdown("### 📅 Daily Net PnL Calendar Heatmap (₹)")
                     cal_df = build_calendar_df(daily_stats)
                     if not cal_df.empty:
                         cal_chart = (
                             alt.Chart(cal_df)
                             .mark_rect()
                             .encode(
-                                x=alt.X('day(Date):O', title='Day of Month'),
+                                x=alt.X('day(Date):O', title='Day'),
                                 y=alt.Y('month(Date):O', title='Month'),
-                                color=alt.Color(
-                                    'PnLPoints:Q',
-                                    title='PnL (Pts)',
-                                    scale=alt.Scale(scheme='redblue', domainMid=0)
+                                color=alt.condition(
+                                    alt.datum.NetPnlRs >= 0,
+                                    alt.value("#16a34a"),  # green
+                                    alt.value("#dc2626"),  # red
                                 ),
-                                tooltip=['Date:T', 'PnLPoints:Q', 'Trades:Q']
+                                tooltip=['Date:T', 'NetPnlRs:Q', 'Trades:Q']
                             )
-                            .properties(height=250)
+                            .properties(height=260)
                         )
                         st.altair_chart(cal_chart, use_container_width=True)
                     else:
@@ -606,7 +713,7 @@ else:
 
                     st.markdown("---")
 
-                    # ======= Price + MA preview =======
+                    # ===== Price + MA =====
                     st.markdown("### 📈 Price with Moving Averages")
                     ma_df = add_moving_averages(price_df, ma_type, fast_period, slow_period)
                     st.dataframe(ma_df[['Open', 'High', 'Low', 'Close', 'fast_ma', 'slow_ma']].tail(50))
@@ -614,105 +721,135 @@ else:
 
                     st.markdown("---")
 
-                    # ======= Performance Charts =======
+                    # ===== Performance Charts =====
                     st.markdown("## 📉 Performance Charts")
+                    e1, e2 = st.columns(2)
 
-                    # Equity & Drawdown
-                    col_e1, col_e2 = st.columns(2)
-
-                    with col_e1:
-                        st.markdown("#### Equity Curve (Cumulative PnL)")
+                    with e1:
+                        st.markdown("#### Equity Curve (₹)")
                         eq_chart = (
                             alt.Chart(daily_stats)
-                            .mark_line()
+                            .mark_line(color="#16a34a")
                             .encode(
                                 x='Date:T',
-                                y=alt.Y('CumPnL:Q', title='Cumulative PnL (Points)'),
-                                tooltip=['Date:T', 'CumPnL:Q']
+                                y=alt.Y('Equity:Q', title='Equity (₹)'),
+                                tooltip=['Date:T', 'Equity:Q']
                             )
                         )
                         st.altair_chart(eq_chart, use_container_width=True)
 
-                    with col_e2:
-                        st.markdown("#### Drawdown Curve")
+                    with e2:
+                        st.markdown("#### Drawdown Curve (₹)")
                         dd_chart = (
                             alt.Chart(daily_stats)
-                            .mark_line()
+                            .mark_line(color="#dc2626")
                             .encode(
                                 x='Date:T',
-                                y=alt.Y('Drawdown:Q', title='Drawdown (Points)'),
-                                tooltip=['Date:T', 'Drawdown:Q']
+                                y=alt.Y('DrawdownRs:Q', title='Drawdown (₹)'),
+                                tooltip=['Date:T', 'DrawdownRs:Q']
                             )
                         )
                         st.altair_chart(dd_chart, use_container_width=True)
 
-                    # Daily PnL & Daily Trades
-                    col_d1, col_d2 = st.columns(2)
+                    # Strategy vs NIFTY %
+                    if nifty_ret_pct is not None and not daily_stats.empty:
+                        st.markdown("### 📈 Strategy Equity vs NIFTY50 (% Return)")
+                        strat_pct = daily_stats[['Date', 'Equity']].copy()
+                        strat_pct['StrategyPct'] = (strat_pct['Equity'] / initial_capital - 1.0) * 100.0
 
-                    with col_d1:
-                        st.markdown("#### Daily PnL (Points)")
+                        nifty_close = (
+                            nifty_data[['Close']]
+                            .copy()
+                            .reset_index()
+                            .rename(columns={'Date': 'Date'})
+                        )
+                        nifty_close['Date'] = pd.to_datetime(nifty_close['Date'])
+                        nifty_close = nifty_close.sort_values('Date').drop_duplicates(subset='Date')
+                        nf_first = nifty_close['Close'].iloc[0]
+                        nifty_close['NiftyPct'] = (nifty_close['Close'] / nf_first - 1.0) * 100.0
+
+                        merge_df = pd.merge(strat_pct[['Date', 'StrategyPct']],
+                                            nifty_close[['Date', 'NiftyPct']],
+                                            on='Date', how='inner')
+
+                        line1 = alt.Chart(merge_df).mark_line(color="#16a34a").encode(
+                            x='Date:T',
+                            y=alt.Y('StrategyPct:Q', title='% Return'),
+                            tooltip=['Date:T', 'StrategyPct:Q']
+                        )
+                        line2 = alt.Chart(merge_df).mark_line(color="#3b82f6").encode(
+                            x='Date:T',
+                            y='NiftyPct:Q',
+                            tooltip=['Date:T', 'NiftyPct:Q']
+                        )
+                        st.altair_chart(line1 + line2, use_container_width=True)
+
+                    st.markdown("---")
+
+                    # Daily PnL & Trades
+                    d1, d2 = st.columns(2)
+                    with d1:
+                        st.markdown("#### Daily Net PnL (₹)")
                         daily_pnl_chart = (
                             alt.Chart(daily_stats)
                             .mark_bar()
                             .encode(
                                 x='Date:T',
-                                y=alt.Y('PnLPoints:Q', title='PnL (Points)'),
-                                tooltip=['Date:T', 'PnLPoints:Q', 'Trades:Q'],
+                                y='NetPnlRs:Q',
+                                tooltip=['Date:T', 'NetPnlRs:Q', 'Trades:Q'],
                                 color=alt.condition(
-                                    alt.datum.PnLPoints >= 0,
-                                    alt.value("green"),
-                                    alt.value("red")
+                                    alt.datum.NetPnlRs >= 0,
+                                    alt.value("#16a34a"),
+                                    alt.value("#dc2626")
                                 )
                             )
                         )
                         st.altair_chart(daily_pnl_chart, use_container_width=True)
 
-                    with col_d2:
+                    with d2:
                         st.markdown("#### Daily Number of Trades")
                         daily_trades_chart = (
                             alt.Chart(daily_stats)
-                            .mark_bar()
+                            .mark_bar(color="#6b7280")
                             .encode(
                                 x='Date:T',
-                                y=alt.Y('Trades:Q', title='Number of Trades'),
+                                y='Trades:Q',
                                 tooltip=['Date:T', 'Trades:Q']
                             )
                         )
                         st.altair_chart(daily_trades_chart, use_container_width=True)
 
-                    # Monthly PnL & Monthly WinRate
+                    # Monthly stats
                     st.markdown("### 📆 Monthly Statistics")
-
-                    monthly_stats = summary["monthly_stats"]
+                    monthly_stats = overall["monthly_stats"]
                     if monthly_stats is not None and not monthly_stats.empty:
-                        col_m1, col_m2 = st.columns(2)
-
-                        with col_m1:
-                            st.markdown("#### Monthly Net PnL (Points)")
+                        m1, m2 = st.columns(2)
+                        with m1:
+                            st.markdown("#### Monthly Net PnL (₹)")
                             ms_pnl_chart = (
                                 alt.Chart(monthly_stats)
                                 .mark_bar()
                                 .encode(
                                     x=alt.X('Month:O', sort=None),
-                                    y=alt.Y('NetPoints:Q', title='Net PnL (Points)'),
-                                    tooltip=['Month', 'NetPoints', 'Trades'],
+                                    y='NetPnlRs:Q',
+                                    tooltip=['Month', 'NetPnlRs', 'Trades'],
                                     color=alt.condition(
-                                        alt.datum.NetPoints >= 0,
-                                        alt.value("green"),
-                                        alt.value("red")
+                                        alt.datum.NetPnlRs >= 0,
+                                        alt.value("#16a34a"),
+                                        alt.value("#dc2626")
                                     )
                                 )
                             )
                             st.altair_chart(ms_pnl_chart, use_container_width=True)
 
-                        with col_m2:
+                        with m2:
                             st.markdown("#### Monthly Win Rate (%)")
                             ms_wr_chart = (
                                 alt.Chart(monthly_stats)
-                                .mark_bar()
+                                .mark_bar(color="#3b82f6")
                                 .encode(
                                     x=alt.X('Month:O', sort=None),
-                                    y=alt.Y('WinRatePct:Q', title='Win Rate (%)'),
+                                    y='WinRatePct:Q',
                                     tooltip=['Month', 'WinRatePct', 'Trades']
                                 )
                             )
@@ -724,13 +861,12 @@ else:
 
                     st.markdown("---")
 
-                    # ======= Distribution Pie (Win / Loss / BE) =======
-                    st.markdown("### 🥧 Trade Outcome Distribution")
-
+                    # Outcome distribution
+                    st.markdown("### 🥧 Trade Outcome Distribution (Net PnL)")
                     outcome_counts = {
-                        "Wins": summary["wins"],
-                        "Losses": summary["losses"],
-                        "Breakeven": summary["breakeven"],
+                        "Wins": (trades_df['NetPnlRs'] > 0).sum(),
+                        "Losses": (trades_df['NetPnlRs'] < 0).sum(),
+                        "Breakeven": (trades_df['NetPnlRs'] == 0).sum(),
                     }
                     dist_df = pd.DataFrame(
                         {"Outcome": list(outcome_counts.keys()),
@@ -742,7 +878,13 @@ else:
                         .mark_arc(innerRadius=40)
                         .encode(
                             theta='Count:Q',
-                            color='Outcome:N',
+                            color=alt.Color(
+                                'Outcome:N',
+                                scale=alt.Scale(
+                                    domain=['Wins', 'Losses', 'Breakeven'],
+                                    range=['#16a34a', '#dc2626', '#6b7280']
+                                )
+                            ),
                             tooltip=['Outcome', 'Count']
                         )
                     )
@@ -750,8 +892,8 @@ else:
 
                     st.markdown("---")
 
-                    # ======= Trades Table & Download =======
-                    st.markdown("## 📋 Trades Table")
+                    # Trades table
+                    st.markdown("## 📋 Trades Table (with Costs)")
                     st.dataframe(trades_df)
 
                     st.download_button(
@@ -760,6 +902,5 @@ else:
                         file_name=f"{symbol}_MA_Backtest_Trades.csv",
                         mime="text/csv"
                     )
-
     else:
-        st.info("Set your parameters on the left and click **Run Backtest** to start.")
+        st.info("Set parameters on the left and click **Run Backtest**.")
