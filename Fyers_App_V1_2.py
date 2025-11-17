@@ -543,12 +543,45 @@ def side_summary(trades_df, side):
     }
 
 
-def build_calendar_df(daily):
-    cal = daily.copy()
-    cal['Year'] = cal['Date'].dt.year
-    cal['Month'] = cal['Date'].dt.month_name().str[:3]
-    cal['Day'] = cal['Date'].dt.day
-    return cal
+# ===== Weekly & Monthly breakup tables =====
+def weekly_breakup(daily_stats):
+    df = daily_stats.copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    df['Year'] = df['Date'].dt.year
+    df['Weekday'] = df['Date'].dt.day_name().str[:3]  # Mon, Tue...
+
+    grp = df.groupby(['Year', 'Weekday'])['NetPnlRs'].sum().reset_index()
+
+    # Pivot
+    week_order = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+    pivot = grp.pivot(index='Year', columns='Weekday', values='NetPnlRs').fillna(0.0)
+    pivot = pivot.reindex(columns=week_order, fill_value=0.0)
+    pivot['Total'] = pivot.sum(axis=1)
+    pivot = pivot.reset_index()
+
+    return pivot
+
+
+def monthly_breakup(daily_stats):
+    df = daily_stats.copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    df['Year'] = df['Date'].dt.year
+    df['Month'] = df['Date'].dt.month_name().str[:3]
+
+    grp = df.groupby(['Year', 'Month'])['NetPnlRs'].sum().reset_index()
+
+    month_order = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                   'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    pivot = grp.pivot(index='Year', columns='Month', values='NetPnlRs').fillna(0.0)
+    pivot = pivot.reindex(columns=month_order, fill_value=0.0)
+    pivot['Total'] = pivot.sum(axis=1)
+    pivot = pivot.reset_index()
+
+    return pivot
 
 
 # ====================== LIVE TRADING HELPERS ===================
@@ -740,6 +773,9 @@ else:
                     daily_stats = build_daily_stats(trades_df, initial_capital)
                     risk = compute_risk_stats(daily_stats)
 
+                    weekly_df = weekly_breakup(daily_stats)
+                    monthly_df = monthly_breakup(daily_stats)
+
                     # ===== NIFTY Benchmark =====
                     nifty_data = fetch_data(NIFTY_SYMBOL, start_date, end_date, resolution)
                     nifty_first = nifty_last = nifty_ret_pct = None
@@ -822,16 +858,17 @@ else:
 
                     st.markdown("---")
 
-                    # ===== Calendar Heatmap =====
-                    st.markdown("### 📅 Daily Net PnL Calendar Heatmap (₹)")
-                    cal_df = build_calendar_df(daily_stats)
-                    if not cal_df.empty:
+                    # ===== Calendar Heatmap (Year x Month) =====
+                    st.markdown("### 📅 Daily Net PnL Heatmap (₹) – Year & Month")
+
+                    if not daily_stats.empty:
+                        cal_df = daily_stats.copy()
                         cal_chart = (
                             alt.Chart(cal_df)
                             .mark_rect()
                             .encode(
-                                x=alt.X('day(Date):O', title='Day'),
-                                y=alt.Y('month(Date):O', title='Month'),
+                                x=alt.X('week(Date):O', title='Week'),
+                                y=alt.Y('day(Date):O', title='Day'),
                                 color=alt.condition(
                                     alt.datum.NetPnlRs >= 0,
                                     alt.value("#16a34a"),  # green
@@ -839,7 +876,13 @@ else:
                                 ),
                                 tooltip=['Date:T', 'NetPnlRs:Q', 'Trades:Q']
                             )
-                            .properties(height=260)
+                            .facet(
+                                row=alt.Row('year(Date):O', header=alt.Header(title='Year')),
+                                column=alt.Column('month(Date):O', header=alt.Header(title='Month'))
+                            )
+                            .properties(
+                                title="Daily PnL Heatmap by Year & Month"
+                            )
                         )
                         st.altair_chart(cal_chart, use_container_width=True)
                     else:
@@ -1032,8 +1075,8 @@ else:
                         )
                         st.altair_chart(daily_trades_chart, use_container_width=True)
 
-                    # Monthly stats
-                    st.markdown("### 📆 Monthly Statistics")
+                    # Monthly stats (from trades)
+                    st.markdown("### 📆 Monthly Statistics (Trade-based)")
                     monthly_stats = overall["monthly_stats"]
                     if monthly_stats is not None and not monthly_stats.empty:
                         m1, m2 = st.columns(2)
@@ -1071,6 +1114,23 @@ else:
                         st.dataframe(monthly_stats)
                     else:
                         st.info("No monthly stats available.")
+
+                    st.markdown("---")
+
+                    # ===== Weekly & Monthly Breakups like myPnL =====
+                    st.markdown("## 📆 Weekly & Monthly Breakups (Based on Daily PnL)")
+
+                    if not weekly_df.empty:
+                        st.markdown("### Weekly Breakups (₹)")
+                        st.dataframe(weekly_df)
+                    else:
+                        st.info("No weekly data.")
+
+                    if not monthly_df.empty:
+                        st.markdown("### Monthly Breakups (₹)")
+                        st.dataframe(monthly_df)
+                    else:
+                        st.info("No monthly data.")
 
                     st.markdown("---")
 
