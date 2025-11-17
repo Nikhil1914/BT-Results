@@ -1,0 +1,4 @@
+streamlit
+fyers-apiv3
+pandas
+datetime
