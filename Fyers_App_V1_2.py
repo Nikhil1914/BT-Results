@@ -11,14 +11,16 @@ import calendar
 with open('access.txt', 'r') as a:
     access_token = a.read().strip()
 
-client_id = 'KB4YGO9V7-100'   # <-- change to your client id if needed
+# CHANGE THIS TO YOUR CLIENT ID
+client_id = 'AWSGEWQA6R-100'
 fyers = fyersModel.FyersModel(client_id=client_id, is_async=False, token=access_token, log_path="")
 
 NIFTY_SYMBOL = "NSE:NIFTY50-INDEX"  # Benchmark
 
 
 # ==================== SYMBOL BUILD FUNCTION ====================
-def build_fyers_symbol(segment, exchange, symbol, year=None, month=None, day=None, strike=None, opt_type=None):
+def build_fyers_symbol(segment, exchange, symbol,
+                       year=None, month=None, day=None, strike=None, opt_type=None):
     if segment == "Equity":
         return f"{exchange}:{symbol}-EQ"
     elif segment == "Index":
@@ -36,13 +38,13 @@ def build_fyers_symbol(segment, exchange, symbol, year=None, month=None, day=Non
 
 
 # ---------- Helper: current / next month futures for index live trading ----------
-def last_thursday(year: int, month: int) -> dt.date:
+def last_thursday(year, month):
     cal = calendar.monthcalendar(year, month)
     thursdays = [week[calendar.THURSDAY] for week in cal if week[calendar.THURSDAY] != 0]
     return dt.date(year, month, thursdays[-1])
 
 
-def current_month_future_symbol(underlying: str, exchange: str = "NFO", as_of: dt.date | None = None) -> str:
+def current_month_future_symbol(underlying, exchange="NFO", as_of=None):
     """
     For Index backtests, live execution will happen on current-month futures:
     e.g. NFO:NIFTY24NOVFUT. If today is after expiry, move to next month.
@@ -187,7 +189,10 @@ def calc_level(entry_price, level_type, level_value, direction="long"):
 
 def compute_pnl_points(direction, entry_price, exit_price):
     """Positive points = profitable, for both long & short."""
-    return exit_price - entry_price if direction == "long" else entry_price - exit_price
+    if direction == "long":
+        return exit_price - entry_price
+    else:
+        return entry_price - exit_price
 
 
 # ===================== BACKTESTING LOGIC =======================
@@ -515,7 +520,7 @@ def latest_strategy_signal(df, ma_type, fast_period, slow_period):
     return None
 
 
-def place_market_order_fyers(symbol: str, side: str, qty: int, product_type: str = "INTRADAY"):
+def place_market_order_fyers(symbol, side, qty, product_type="INTRADAY"):
     """
     Place a simple market order via Fyers.
     side: 'BUY' or 'SELL'
@@ -559,10 +564,10 @@ segment = st.sidebar.selectbox("Segment", [
 exchange = st.sidebar.selectbox("Exchange", ["NSE", "BSE", "MCX", "CDS", "NFO"])
 symbol = st.sidebar.text_input("Symbol", value="NIFTY50")
 
-year, month, day, strike, opt_type = None, None, None, None, None
+year = month = day = strike = opt_type = None
 if segment not in ["Index", "Equity"]:
     years = list(range(2017, dt.date.today().year + 2))
-    year = st.sidebar.selectbox("Year", years, index=len(years)-1)
+    year = st.sidebar.selectbox("Year", years, index=len(years) - 1)
 
     month = st.sidebar.selectbox("Month", [
         "JAN", "FEB", "MAR", "APR", "MAY", "JUN",
@@ -987,7 +992,7 @@ else:
                     st.markdown("## ⚡ Live Deployment to Fyers (Use with Caution)")
                     st.caption(
                         "Index backtests will execute on current-month futures (e.g. NFO:NIFTYxxMONFUT). "
-                        "Verify everything in paper / small size first."
+                        "Always test with small quantity / paper first."
                     )
 
                     live_enable = st.checkbox("Enable live order section")
@@ -1010,7 +1015,9 @@ else:
 
                         # Determine live trading symbol
                         if segment == "Index":
-                            live_symbol = current_month_future_symbol(symbol.replace("NIFTY50", "NIFTY").replace("BANKNIFTY", "BANKNIFTY"))
+                            # crude mapping: NIFTY50 index → NIFTY futures underlying
+                            underlying = symbol.replace("NIFTY50", "NIFTY")
+                            live_symbol = current_month_future_symbol(underlying)
                         else:
                             live_symbol = fyers_symbol
 
@@ -1023,7 +1030,7 @@ else:
                             elif live_mode == "Manual SELL":
                                 side = "SELL"
                             else:
-                                # Use latest MA crossover signal
+                                # Use latest MA crossover signal on recent data
                                 latest_data = fetch_data(
                                     fyers_symbol,
                                     dt.date.today() - dt.timedelta(days=5),
@@ -1033,22 +1040,22 @@ else:
                                 if latest_data.empty:
                                     st.error("Could not fetch recent data for live signal.")
                                 else:
-                                    last_ma_signal = latest_strategy_signal(
+                                    last_sig = latest_strategy_signal(
                                         latest_data[['Open', 'High', 'Low', 'Close']],
                                         ma_type,
                                         fast_period,
                                         slow_period
                                     )
-                                    if last_ma_signal is None:
+                                    if last_sig is None:
                                         st.warning("No fresh crossover signal on latest data. No order placed.")
                                     else:
-                                        if last_ma_signal == "long" and trade_side in ["Long Only", "Long & Short"]:
+                                        if last_sig == "long" and trade_side in ["Long Only", "Long & Short"]:
                                             side = "BUY"
-                                        elif last_ma_signal == "short" and trade_side in ["Short Only", "Long & Short"]:
+                                        elif last_sig == "short" and trade_side in ["Short Only", "Long & Short"]:
                                             side = "SELL"
                                         else:
                                             st.warning(
-                                                f"Latest signal is '{last_ma_signal}', "
+                                                f"Latest signal is '{last_sig}', "
                                                 f"but trade side is '{trade_side}'. No order placed."
                                             )
 
