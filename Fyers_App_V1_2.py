@@ -209,6 +209,10 @@ def backtest_ma_crossover(
     trade_mode="Intraday",      # Intraday / Positional
     trade_side="Long Only",     # Long Only / Short Only / Long & Short
 ):
+    """
+    Entry: NEXT candle open after crossover.
+    In Long & Short mode, flips position on opposite crossover signal.
+    """
     if df.empty:
         return pd.DataFrame()
 
@@ -241,7 +245,45 @@ def backtest_ma_crossover(
         prev_ts = df.index[i - 1]
         signal_prev = prev_row['signal']
 
-        # ----- Exit on day change (Intraday only) -----
+        # ------------------------------------------------------------------
+        # 1) FLIP ON OPPOSITE SIGNAL (only in Long & Short mode)
+        # ------------------------------------------------------------------
+        if in_trade and trade_side == "Long & Short":
+            flip_to_long = (direction == "short" and signal_prev == 1)
+            flip_to_short = (direction == "long" and signal_prev == -1)
+
+            if flip_to_long or flip_to_short:
+                # exit current trade at THIS bar open
+                exit_price = row['Open']
+                exit_time = ts
+                pnl_points = compute_pnl_points(direction, entry_price, exit_price)
+                trades.append({
+                    "Entry Time": entry_time,
+                    "Exit Time": exit_time,
+                    "Direction": direction,
+                    "Entry Price": entry_price,
+                    "Exit Price": exit_price,
+                    "PnL Points": pnl_points,
+                    "Exit Reason": "Signal Flip",
+                    "Entry Date": entry_time.date()
+                })
+
+                # immediately open new trade in opposite direction at same open
+                if flip_to_long:
+                    direction = "long"
+                else:
+                    direction = "short"
+
+                entry_price = row['Open']
+                entry_time = ts
+                trade_date = ts.date()
+                tp_price, sl_price = calc_level(entry_price, tp_type, tp_value, direction)
+                # go to next bar
+                continue
+
+        # ------------------------------------------------------------------
+        # 2) EXIT ON DAY CHANGE (Intraday only)
+        # ------------------------------------------------------------------
         if in_trade and trade_mode == "Intraday" and ts.date() != trade_date:
             exit_price = prev_row['Close']
             exit_time = prev_ts
@@ -259,7 +301,9 @@ def backtest_ma_crossover(
             in_trade = False
             entry_price = entry_time = tp_price = sl_price = trade_date = direction = None
 
-        # ----- Manage open trade: TP / SL -----
+        # ------------------------------------------------------------------
+        # 3) MANAGE OPEN TRADE: TP / SL
+        # ------------------------------------------------------------------
         if in_trade:
             bar_high = row['High']
             bar_low = row['Low']
@@ -301,7 +345,9 @@ def backtest_ma_crossover(
                 entry_price = entry_time = tp_price = sl_price = trade_date = direction = None
                 continue
 
-        # ----- Intraday forced exit at 14:55 -----
+        # ------------------------------------------------------------------
+        # 4) INTRADAY FORCED EXIT AT 14:55
+        # ------------------------------------------------------------------
         if in_trade and trade_mode == "Intraday":
             if ts.time() >= intraday_exit_time and ts.date() == trade_date:
                 exit_price = row['Close']
@@ -321,7 +367,9 @@ def backtest_ma_crossover(
                 entry_price = entry_time = tp_price = sl_price = trade_date = direction = None
                 continue
 
-        # ----- New entry -----
+        # ------------------------------------------------------------------
+        # 5) NEW ENTRY WHEN FLAT
+        # ------------------------------------------------------------------
         if not in_trade:
             # Long entries
             if trade_side in ["Long Only", "Long & Short"] and signal_prev == 1:
@@ -341,7 +389,9 @@ def backtest_ma_crossover(
                 tp_price, sl_price = calc_level(entry_price, tp_type, tp_value, direction)
                 in_trade = True
 
-    # ----- Final open trade exit -----
+    # ----------------------------------------------------------------------
+    # 6) FINAL OPEN TRADE EXIT
+    # ----------------------------------------------------------------------
     if in_trade:
         last_row = df.iloc[-1]
         last_ts = df.index[-1]
@@ -797,11 +847,90 @@ else:
 
                     st.markdown("---")
 
-                    # ===== Price + MA =====
-                    st.markdown("### 📈 Price with Moving Averages")
+                    # ===== Price + MA + Markers (Zoomable) =====
+                    st.markdown("### 📈 Price + Moving Averages + Trade Markers (Zoomable)")
+
                     ma_df = add_moving_averages(price_df, ma_type, fast_period, slow_period)
-                    st.dataframe(ma_df[['Open', 'High', 'Low', 'Close', 'fast_ma', 'slow_ma']].tail(50))
-                    st.line_chart(ma_df[['Close', 'fast_ma', 'slow_ma']].tail(500))
+                    plot_df = ma_df.copy()
+                    plot_df = plot_df.reset_index()
+                    if 'index' in plot_df.columns:
+                        plot_df.rename(columns={'index': 'Date'}, inplace=True)
+                    plot_df['Time'] = plot_df['Date']
+
+                    markers_df = trades_df.copy()
+                    markers_df['Entry Time'] = pd.to_datetime(markers_df['Entry Time'])
+                    markers_df['Exit Time'] = pd.to_datetime(markers_df['Exit Time'])
+
+                    # Base price + MAs
+                    price_line = alt.Chart(plot_df).mark_line().encode(
+                        x=alt.X('Time:T', title='Date'),
+                        y=alt.Y('Close:Q', title='Price'),
+                        tooltip=['Time:T', 'Open', 'High', 'Low', 'Close']
+                    )
+
+                    fast_ma_line = alt.Chart(plot_df).mark_line(color="#3b82f6").encode(
+                        x='Time:T', y='fast_ma:Q'
+                    )
+
+                    slow_ma_line = alt.Chart(plot_df).mark_line(color="#fb923c").encode(
+                        x='Time:T', y='slow_ma:Q'
+                    )
+
+                    # Crossover markers
+                    bull_cross = alt.Chart(plot_df[plot_df['signal'] == 1]).mark_point(
+                        color='blue', size=80, shape='circle'
+                    ).encode(
+                        x='Time:T', y='Close:Q',
+                        tooltip=['Time:T', 'Close']
+                    )
+
+                    bear_cross = alt.Chart(plot_df[plot_df['signal'] == -1]).mark_point(
+                        color='red', size=80, shape='circle'
+                    ).encode(
+                        x='Time:T', y='Close:Q',
+                        tooltip=['Time:T', 'Close']
+                    )
+
+                    # Entry markers
+                    long_entries = markers_df[markers_df['Direction'] == "long"]
+                    short_entries = markers_df[markers_df['Direction'] == "short"]
+
+                    long_marker = alt.Chart(long_entries).mark_triangle(
+                        size=140, color="#16a34a"
+                    ).encode(
+                        x='Entry Time:T',
+                        y='Entry Price:Q',
+                        tooltip=['Entry Time', 'Entry Price']
+                    )
+
+                    short_marker = alt.Chart(short_entries).mark_triangle(
+                        size=140, color="#dc2626", direction='down'
+                    ).encode(
+                        x='Entry Time:T',
+                        y='Entry Price:Q',
+                        tooltip=['Entry Time', 'Entry Price']
+                    )
+
+                    # Exit markers
+                    exit_marker = alt.Chart(markers_df).mark_point(
+                        size=120, color="black", shape="diamond"
+                    ).encode(
+                        x='Exit Time:T',
+                        y='Exit Price:Q',
+                        tooltip=['Exit Time', 'Exit Price', 'Exit Reason']
+                    )
+
+                    final_chart = (
+                        price_line + fast_ma_line + slow_ma_line +
+                        bull_cross + bear_cross +
+                        long_marker + short_marker + exit_marker
+                    ).interactive().properties(
+                        width="container",
+                        height=500,
+                        title="Zoomable Price / MA / Trades"
+                    )
+
+                    st.altair_chart(final_chart, use_container_width=True)
 
                     st.markdown("---")
 
@@ -1015,7 +1144,6 @@ else:
 
                         # Determine live trading symbol
                         if segment == "Index":
-                            # crude mapping: NIFTY50 index → NIFTY futures underlying
                             underlying = symbol.replace("NIFTY50", "NIFTY")
                             live_symbol = current_month_future_symbol(underlying)
                         else:
