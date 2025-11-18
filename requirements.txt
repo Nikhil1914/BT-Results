@@ -1,4 +1,6 @@
 streamlit
-fyers_apiv3
 pandas
-datetime
+numpy
+altair
+websocket-client
+fyers-apiv3
