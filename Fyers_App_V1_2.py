@@ -44,10 +44,10 @@ def last_thursday(year, month):
     return dt.date(year, month, thursdays[-1])
 
 
-def current_month_future_symbol(underlying, exchange="NFO", as_of=None):
+def current_month_future_symbol(underlying_root, exchange="NFO", as_of=None):
     """
-    For Index backtests, live execution will happen on current-month futures:
-    e.g. NFO:NIFTY24NOVFUT. If today is after expiry, move to next month.
+    Build current-month futures symbol for underlying_root on given exchange.
+    Example: underlying_root='NIFTY' -> NFO:NIFTY24NOVFUT
     """
     if as_of is None:
         as_of = dt.date.today()
@@ -55,7 +55,7 @@ def current_month_future_symbol(underlying, exchange="NFO", as_of=None):
     year = as_of.year
     month = as_of.month
     exp = last_thursday(year, month)
-    if as_of > exp:  # after expiry → next month
+    if as_of > exp:  # after expiry -> next month
         if month == 12:
             year += 1
             month = 1
@@ -66,7 +66,7 @@ def current_month_future_symbol(underlying, exchange="NFO", as_of=None):
     month_code = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
                   "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"][month - 1]
     yy = str(year)[-2:]
-    return f"{exchange}:{underlying}{yy}{month_code}FUT"
+    return f"{exchange}:{underlying_root}{yy}{month_code}FUT"
 
 
 # =================== HISTORICAL DATA FETCH =====================
@@ -269,16 +269,11 @@ def backtest_ma_crossover(
                 })
 
                 # immediately open new trade in opposite direction at same open
-                if flip_to_long:
-                    direction = "long"
-                else:
-                    direction = "short"
-
+                direction = "long" if flip_to_long else "short"
                 entry_price = row['Open']
                 entry_time = ts
                 trade_date = ts.date()
                 tp_price, sl_price = calc_level(entry_price, tp_type, tp_value, direction)
-                # go to next bar
                 continue
 
         # ------------------------------------------------------------------
@@ -543,28 +538,8 @@ def side_summary(trades_df, side):
     }
 
 
-# ===== Weekly & Monthly breakup tables =====
-def weekly_breakup(daily_stats):
-    df = daily_stats.copy()
-    if df.empty:
-        return pd.DataFrame()
-
-    df['Year'] = df['Date'].dt.year
-    df['Weekday'] = df['Date'].dt.day_name().str[:3]  # Mon, Tue...
-
-    grp = df.groupby(['Year', 'Weekday'])['NetPnlRs'].sum().reset_index()
-
-    # Pivot
-    week_order = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
-    pivot = grp.pivot(index='Year', columns='Weekday', values='NetPnlRs').fillna(0.0)
-    pivot = pivot.reindex(columns=week_order, fill_value=0.0)
-    pivot['Total'] = pivot.sum(axis=1)
-    pivot = pivot.reset_index()
-
-    return pivot
-
-
 def monthly_breakup(daily_stats):
+    """For monthly heatmap & table – aggregated daily PnL to month-level."""
     df = daily_stats.copy()
     if df.empty:
         return pd.DataFrame()
@@ -772,8 +747,6 @@ else:
                     overall = compute_overall_summary(trades_df, initial_capital)
                     daily_stats = build_daily_stats(trades_df, initial_capital)
                     risk = compute_risk_stats(daily_stats)
-
-                    weekly_df = weekly_breakup(daily_stats)
                     monthly_df = monthly_breakup(daily_stats)
 
                     # ===== NIFTY Benchmark =====
@@ -858,7 +831,7 @@ else:
 
                     st.markdown("---")
 
-                    # ===== Calendar Heatmap (Year x Month) =====
+                    # ===== Daily Heatmap (Year × Month) =====
                     st.markdown("### 📅 Daily Net PnL Heatmap (₹) – Year & Month")
 
                     if not daily_stats.empty:
@@ -890,12 +863,49 @@ else:
 
                     st.markdown("---")
 
+                    # ===== Monthly Heatmap (Year × Month, aggregated) =====
+                    st.markdown("### 📆 Monthly PnL Heatmap (₹)")
+
+                    if not monthly_df.empty:
+                        month_order = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                                       'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+                        m_long = monthly_df.melt(
+                            id_vars='Year',
+                            value_vars=[m for m in month_order if m in monthly_df.columns],
+                            var_name='Month',
+                            value_name='NetPnlRs'
+                        )
+                        m_long['Month'] = pd.Categorical(m_long['Month'], categories=month_order, ordered=True)
+
+                        monthly_heat = (
+                            alt.Chart(m_long)
+                            .mark_rect()
+                            .encode(
+                                x=alt.X('Year:O', title='Year'),
+                                y=alt.Y('Month:O', sort=month_order, title='Month'),
+                                color=alt.condition(
+                                    alt.datum.NetPnlRs >= 0,
+                                    alt.value("#16a34a"),
+                                    alt.value("#dc2626")
+                                ),
+                                tooltip=['Year:O', 'Month:O', 'NetPnlRs:Q']
+                            )
+                            .properties(height=260)
+                        )
+                        st.altair_chart(monthly_heat, use_container_width=True)
+
+                        st.markdown("#### Monthly Breakup Table (₹)")
+                        st.dataframe(monthly_df)
+                    else:
+                        st.info("No monthly data.")
+
+                    st.markdown("---")
+
                     # ===== Price + MA + Markers (Zoomable) =====
                     st.markdown("### 📈 Price + Moving Averages + Trade Markers (Zoomable)")
 
                     ma_df = add_moving_averages(price_df, ma_type, fast_period, slow_period)
-                    plot_df = ma_df.copy()
-                    plot_df = plot_df.reset_index()
+                    plot_df = ma_df.copy().reset_index()
                     if 'index' in plot_df.columns:
                         plot_df.rename(columns={'index': 'Date'}, inplace=True)
                     plot_df['Time'] = plot_df['Date']
@@ -904,7 +914,6 @@ else:
                     markers_df['Entry Time'] = pd.to_datetime(markers_df['Entry Time'])
                     markers_df['Exit Time'] = pd.to_datetime(markers_df['Exit Time'])
 
-                    # Base price + MAs
                     price_line = alt.Chart(plot_df).mark_line().encode(
                         x=alt.X('Time:T', title='Date'),
                         y=alt.Y('Close:Q', title='Price'),
@@ -919,7 +928,6 @@ else:
                         x='Time:T', y='slow_ma:Q'
                     )
 
-                    # Crossover markers
                     bull_cross = alt.Chart(plot_df[plot_df['signal'] == 1]).mark_point(
                         color='blue', size=80, shape='circle'
                     ).encode(
@@ -934,27 +942,25 @@ else:
                         tooltip=['Time:T', 'Close']
                     )
 
-                    # Entry markers
                     long_entries = markers_df[markers_df['Direction'] == "long"]
                     short_entries = markers_df[markers_df['Direction'] == "short"]
 
-                    long_marker = alt.Chart(long_entries).mark_triangle(
-                        size=140, color="#16a34a"
+                    long_marker = alt.Chart(long_entries).mark_point(
+                        size=140, color="#16a34a", shape='triangle-up'
                     ).encode(
                         x='Entry Time:T',
                         y='Entry Price:Q',
                         tooltip=['Entry Time', 'Entry Price']
                     )
 
-                    short_marker = alt.Chart(short_entries).mark_triangle(
-                        size=140, color="#dc2626", direction='down'
+                    short_marker = alt.Chart(short_entries).mark_point(
+                        size=140, color="#dc2626", shape='triangle-down'
                     ).encode(
                         x='Entry Time:T',
                         y='Entry Price:Q',
                         tooltip=['Entry Time', 'Entry Price']
                     )
 
-                    # Exit markers
                     exit_marker = alt.Chart(markers_df).mark_point(
                         size=120, color="black", shape="diamond"
                     ).encode(
@@ -1075,7 +1081,7 @@ else:
                         )
                         st.altair_chart(daily_trades_chart, use_container_width=True)
 
-                    # Monthly stats (from trades)
+                    # Monthly stats from trades
                     st.markdown("### 📆 Monthly Statistics (Trade-based)")
                     monthly_stats = overall["monthly_stats"]
                     if monthly_stats is not None and not monthly_stats.empty:
@@ -1114,23 +1120,6 @@ else:
                         st.dataframe(monthly_stats)
                     else:
                         st.info("No monthly stats available.")
-
-                    st.markdown("---")
-
-                    # ===== Weekly & Monthly Breakups like myPnL =====
-                    st.markdown("## 📆 Weekly & Monthly Breakups (Based on Daily PnL)")
-
-                    if not weekly_df.empty:
-                        st.markdown("### Weekly Breakups (₹)")
-                        st.dataframe(weekly_df)
-                    else:
-                        st.info("No weekly data.")
-
-                    if not monthly_df.empty:
-                        st.markdown("### Monthly Breakups (₹)")
-                        st.dataframe(monthly_df)
-                    else:
-                        st.info("No monthly data.")
 
                     st.markdown("---")
 
@@ -1178,10 +1167,10 @@ else:
 
                     # ==================== LIVE DEPLOYMENT ====================
                     st.markdown("---")
-                    st.markdown("## ⚡ Live Deployment to Fyers (Use with Caution)")
+                    st.markdown("## ⚡ Live Deployment to Fyers (API v3) – Use with Caution")
                     st.caption(
-                        "Index backtests will execute on current-month futures (e.g. NFO:NIFTYxxMONFUT). "
-                        "Always test with small quantity / paper first."
+                        "For Index backtests this will place orders in current-month index futures on NFO. "
+                        "Always start with small size / paper trading."
                     )
 
                     live_enable = st.checkbox("Enable live order section")
@@ -1195,21 +1184,28 @@ else:
                                 index=0
                             )
                         with live_col2:
-                            live_qty = st.number_input(
-                                "Live Quantity", min_value=1, value=quantity, step=1
-                            )
+                            lot_size = quantity
+                            lots = st.number_input("Number of Lots", min_value=1, value=1, step=1)
+                            live_qty = lot_size * lots
                             live_product = st.selectbox(
                                 "Product Type", ["INTRADAY", "MARGIN"], index=0
                             )
 
                         # Determine live trading symbol
                         if segment == "Index":
-                            underlying = symbol.replace("NIFTY50", "NIFTY")
-                            live_symbol = current_month_future_symbol(underlying)
+                            # Map backtested index to futures root
+                            if symbol.upper() == "NIFTY50":
+                                underlying_root = "NIFTY"
+                            elif symbol.upper() in ["BANKNIFTY", "NIFTYBANK"]:
+                                underlying_root = "BANKNIFTY"
+                            else:
+                                underlying_root = symbol.upper()
+
+                            live_symbol = current_month_future_symbol(underlying_root, exchange="NFO")
                         else:
                             live_symbol = fyers_symbol
 
-                        st.write(f"Live trading symbol will be: **{live_symbol}**")
+                        st.write(f"Live trading symbol will be: **{live_symbol}**, Qty: **{live_qty}**")
 
                         if st.button("✅ Place Live Order Now"):
                             side = None
