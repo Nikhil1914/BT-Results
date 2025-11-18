@@ -5,6 +5,7 @@ import numpy as np
 import datetime as dt
 import altair as alt
 import calendar
+import time  # for auto-live loop
 
 # ========================= FYERS SETUP =========================
 # access.txt must contain your access token string
@@ -245,15 +246,12 @@ def backtest_ma_crossover(
         prev_ts = df.index[i - 1]
         signal_prev = prev_row['signal']
 
-        # ------------------------------------------------------------------
-        # 1) FLIP ON OPPOSITE SIGNAL (only in Long & Short mode)
-        # ------------------------------------------------------------------
+        # 1) Flip on opposite signal (only in Long & Short mode)
         if in_trade and trade_side == "Long & Short":
             flip_to_long = (direction == "short" and signal_prev == 1)
             flip_to_short = (direction == "long" and signal_prev == -1)
 
             if flip_to_long or flip_to_short:
-                # exit current trade at THIS bar open
                 exit_price = row['Open']
                 exit_time = ts
                 pnl_points = compute_pnl_points(direction, entry_price, exit_price)
@@ -268,7 +266,6 @@ def backtest_ma_crossover(
                     "Entry Date": entry_time.date()
                 })
 
-                # immediately open new trade in opposite direction at same open
                 direction = "long" if flip_to_long else "short"
                 entry_price = row['Open']
                 entry_time = ts
@@ -276,9 +273,7 @@ def backtest_ma_crossover(
                 tp_price, sl_price = calc_level(entry_price, tp_type, tp_value, direction)
                 continue
 
-        # ------------------------------------------------------------------
-        # 2) EXIT ON DAY CHANGE (Intraday only)
-        # ------------------------------------------------------------------
+        # 2) Exit on day change (Intraday only)
         if in_trade and trade_mode == "Intraday" and ts.date() != trade_date:
             exit_price = prev_row['Close']
             exit_time = prev_ts
@@ -296,9 +291,7 @@ def backtest_ma_crossover(
             in_trade = False
             entry_price = entry_time = tp_price = sl_price = trade_date = direction = None
 
-        # ------------------------------------------------------------------
-        # 3) MANAGE OPEN TRADE: TP / SL
-        # ------------------------------------------------------------------
+        # 3) Manage open trade: TP / SL
         if in_trade:
             bar_high = row['High']
             bar_low = row['Low']
@@ -306,7 +299,7 @@ def backtest_ma_crossover(
             if direction == "long":
                 hit_tp = bar_high >= tp_price
                 hit_sl = bar_low <= sl_price
-            else:  # short
+            else:
                 hit_tp = bar_low <= tp_price
                 hit_sl = bar_high >= sl_price
 
@@ -340,9 +333,7 @@ def backtest_ma_crossover(
                 entry_price = entry_time = tp_price = sl_price = trade_date = direction = None
                 continue
 
-        # ------------------------------------------------------------------
-        # 4) INTRADAY FORCED EXIT AT 14:55
-        # ------------------------------------------------------------------
+        # 4) Intraday forced exit at 14:55
         if in_trade and trade_mode == "Intraday":
             if ts.time() >= intraday_exit_time and ts.date() == trade_date:
                 exit_price = row['Close']
@@ -362,11 +353,8 @@ def backtest_ma_crossover(
                 entry_price = entry_time = tp_price = sl_price = trade_date = direction = None
                 continue
 
-        # ------------------------------------------------------------------
-        # 5) NEW ENTRY WHEN FLAT
-        # ------------------------------------------------------------------
+        # 5) New entry when flat
         if not in_trade:
-            # Long entries
             if trade_side in ["Long Only", "Long & Short"] and signal_prev == 1:
                 direction = "long"
                 entry_price = row['Open']
@@ -374,8 +362,6 @@ def backtest_ma_crossover(
                 trade_date = ts.date()
                 tp_price, sl_price = calc_level(entry_price, tp_type, tp_value, direction)
                 in_trade = True
-
-            # Short entries
             elif trade_side in ["Short Only", "Long & Short"] and signal_prev == -1:
                 direction = "short"
                 entry_price = row['Open']
@@ -384,9 +370,7 @@ def backtest_ma_crossover(
                 tp_price, sl_price = calc_level(entry_price, tp_type, tp_value, direction)
                 in_trade = True
 
-    # ----------------------------------------------------------------------
-    # 6) FINAL OPEN TRADE EXIT
-    # ----------------------------------------------------------------------
+    # 6) Final open trade exit
     if in_trade:
         last_row = df.iloc[-1]
         last_ts = df.index[-1]
@@ -587,7 +571,7 @@ def place_market_order_fyers(symbol, side, qty, product_type="INTRADAY"):
     side_val = 1 if side == "BUY" else -1
     order_data = {
         "symbol": symbol,
-        "qty": qty,
+        "qty": int(qty),
         "type": 2,           # 2 = MARKET
         "side": side_val,    # 1 = Buy, -1 = Sell
         "productType": product_type,
@@ -604,6 +588,18 @@ def place_market_order_fyers(symbol, side, qty, product_type="INTRADAY"):
         return resp
     except Exception as e:
         return {"s": "error", "message": str(e)}
+
+
+def close_position_if_any(symbol, position_side, qty, product_type="INTRADAY"):
+    """
+    Simple closer using our in-app state.
+    """
+    if position_side == "long":
+        return place_market_order_fyers(symbol, "SELL", qty, product_type)
+    elif position_side == "short":
+        return place_market_order_fyers(symbol, "BUY", qty, product_type)
+    else:
+        return {"s": "ok", "message": "No position to close (state=flat)."}
 
 
 # ======================= STREAMLIT UI ==========================
@@ -844,8 +840,8 @@ else:
                                 y=alt.Y('day(Date):O', title='Day'),
                                 color=alt.condition(
                                     alt.datum.NetPnlRs >= 0,
-                                    alt.value("#16a34a"),  # green
-                                    alt.value("#dc2626"),  # red
+                                    alt.value("#16a34a"),
+                                    alt.value("#dc2626"),
                                 ),
                                 tooltip=['Date:T', 'NetPnlRs:Q', 'Trades:Q']
                             )
@@ -1166,200 +1162,210 @@ else:
                     )
 
                     # ==================== LIVE DEPLOYMENT ====================
-st.markdown("---")
-st.markdown("## ⚡ Live Deployment to Fyers (API v3) – Use with EXTREME Caution")
-st.caption(
-    "For Index backtests this will place orders in current-month index futures on NFO. "
-    "Always start with tiny size / paper trading. This code does NOT read your real "
-    "positions from Fyers – it only tracks state inside this app."
-)
-
-live_enable = st.checkbox("Enable live order section")
-
-if live_enable:
-    # Initialise session state
-    if "auto_running" not in st.session_state:
-        st.session_state.auto_running = False
-    if "live_position" not in st.session_state:
-        st.session_state.live_position = "flat"   # 'flat' / 'long' / 'short'
-    if "last_signal" not in st.session_state:
-        st.session_state.last_signal = None
-
-    live_col1, live_col2 = st.columns(2)
-    with live_col1:
-        live_mode = st.radio(
-            "Live Mode",
-            ["Manual one-click", "Auto (strategy driven)"],
-            index=0
-        )
-    with live_col2:
-        lot_size = quantity   # from sidebar
-        lots = st.number_input("Number of Lots", min_value=1, value=1, step=1)
-        live_qty = lot_size * lots
-        live_product = st.selectbox(
-            "Product Type", ["INTRADAY", "MARGIN"], index=0
-        )
-
-    # Determine live trading symbol
-    if segment == "Index":
-        # Map backtested index to futures root
-        if symbol.upper() == "NIFTY50":
-            underlying_root = "NIFTY"
-        elif symbol.upper() in ["BANKNIFTY", "NIFTYBANK"]:
-            underlying_root = "BANKNIFTY"
-        else:
-            underlying_root = symbol.upper()
-
-        live_symbol = current_month_future_symbol(underlying_root, exchange="NFO")
-    else:
-        live_symbol = fyers_symbol
-
-    st.write(f"Live trading symbol: **{live_symbol}**, Qty per trade: **{live_qty}**")
-
-    # ------------- MANUAL ONE-CLICK MODE -------------
-    if live_mode == "Manual one-click":
-        act_col1, act_col2, act_col3 = st.columns(3)
-        with act_col1:
-            if st.button("Manual BUY"):
-                st.info(f"Sending BUY {live_qty} on {live_symbol}")
-                resp = place_market_order_fyers(live_symbol, "BUY", live_qty, live_product)
-                st.write("Response:", resp)
-                st.session_state.live_position = "long"
-        with act_col2:
-            if st.button("Manual SELL"):
-                st.info(f"Sending SELL {live_qty} on {live_symbol}")
-                resp = place_market_order_fyers(live_symbol, "SELL", live_qty, live_product)
-                st.write("Response:", resp)
-                st.session_state.live_position = "short"
-        with act_col3:
-            if st.button("Close Position (opposite order)"):
-                st.info(f"Closing position on {live_symbol} using opposite order")
-                resp = close_position_if_any(live_symbol, st.session_state.live_position, live_qty, live_product)
-                st.write("Response:", resp)
-                st.session_state.live_position = "flat"
-
-    # ------------- AUTO STRATEGY MODE -------------
-    else:
-        st.markdown("### 🤖 Auto Trader Settings")
-        check_interval = st.number_input(
-            "Check interval (seconds)",
-            min_value=10, max_value=900, value=60, step=10
-        )
-        max_checks = st.number_input(
-            "Max checks in this run (safety)",
-            min_value=1, max_value=1000, value=100, step=1
-        )
-        intraday_squareoff_hour = st.number_input(
-            "Intraday square-off hour (24h, local time)",
-            min_value=9, max_value=23, value=15
-        )
-        intraday_squareoff_min = st.number_input(
-            "Intraday square-off minute",
-            min_value=0, max_value=59, value=20
-        )
-
-        st.warning(
-            "In auto mode the app will loop inside this session, fetch latest candles, "
-            "and place orders whenever a new MA crossover appears, respecting your "
-            "Trade Side (Long/Short/Combined). It **does not** sync with real Fyers positions."
-        )
-
-        start_auto = st.button("🚀 Start Auto Trader Loop")
-
-        if start_auto:
-            st.session_state.auto_running = True
-
-        if st.session_state.auto_running:
-            st.success("Auto trader is RUNNING in this session...")
-            log_area = st.empty()
-
-            for i in range(int(max_checks)):
-                now = dt.datetime.now()
-                now_time = now.time()
-                log_lines = []
-
-                # 1) Fetch recent data for signal
-                latest_data = fetch_data(
-                    fyers_symbol,
-                    dt.date.today() - dt.timedelta(days=5),
-                    dt.date.today(),
-                    resolution
-                )
-                if latest_data.empty:
-                    log_lines.append(f"[{now}] No recent data, skipping check {i+1}.")
-                else:
-                    sig = latest_strategy_signal(
-                        latest_data[['Open', 'High', 'Low', 'Close']],
-                        ma_type,
-                        fast_period,
-                        slow_period
+                    st.markdown("---")
+                    st.markdown("## ⚡ Live Deployment to Fyers (API v3) – Use with EXTREME Caution")
+                    st.caption(
+                        "For Index backtests this will place orders in current-month index futures on NFO. "
+                        "Always start with tiny size / paper trading. "
+                        "This code does NOT read your real Fyers positions – only in-app state."
                     )
-                    log_lines.append(f"[{now}] Latest signal: {sig}, position: {st.session_state.live_position}")
 
-                    # 2) Intraday square-off
-                    if trade_mode == "Intraday":
-                        sq_time = dt.time(intraday_squareoff_hour, intraday_squareoff_min)
-                        if now_time >= sq_time and st.session_state.live_position != "flat":
-                            log_lines.append("Square-off time reached. Closing intraday position.")
-                            resp = close_position_if_any(
-                                live_symbol,
-                                st.session_state.live_position,
-                                live_qty,
-                                live_product
-                            )
-                            log_lines.append(f"Square-off response: {resp}")
-                            st.session_state.live_position = "flat"
+                    live_enable = st.checkbox("Enable live order section")
+
+                    if live_enable:
+                        # Initialise session state
+                        if "auto_running" not in st.session_state:
+                            st.session_state.auto_running = False
+                        if "live_position" not in st.session_state:
+                            st.session_state.live_position = "flat"   # 'flat' / 'long' / 'short'
+                        if "last_signal" not in st.session_state:
                             st.session_state.last_signal = None
 
-                    # 3) Entry / flip logic based on new signal
-                    if sig is not None:
-                        new_side = None
+                        live_col1, live_col2 = st.columns(2)
+                        with live_col1:
+                            live_mode = st.radio(
+                                "Live Mode",
+                                ["Manual one-click", "Auto (strategy driven)"],
+                                index=0
+                            )
+                        with live_col2:
+                            lot_size = quantity   # from sidebar
+                            lots = st.number_input("Number of Lots", min_value=1, value=1, step=1)
+                            live_qty = lot_size * lots
+                            live_product = st.selectbox(
+                                "Product Type", ["INTRADAY", "MARGIN"], index=0
+                            )
 
-                        # Respect Trade Side setting
-                        if sig == "long" and trade_side in ["Long Only", "Long & Short"]:
-                            new_side = "BUY"
-                        elif sig == "short" and trade_side in ["Short Only", "Long & Short"]:
-                            new_side = "SELL"
+                        # Determine live trading symbol
+                        if segment == "Index":
+                            if symbol.upper() == "NIFTY50":
+                                underlying_root = "NIFTY"
+                            elif symbol.upper() in ["BANKNIFTY", "NIFTYBANK"]:
+                                underlying_root = "BANKNIFTY"
+                            else:
+                                underlying_root = symbol.upper()
 
-                        # Only act if signal direction changed
-                        if new_side and sig != st.session_state.last_signal:
-                            log_lines.append(f"New actionable signal: {sig} ({new_side}).")
-
-                            # If already in opposite position, close first
-                            if st.session_state.live_position == "long" and new_side == "SELL":
-                                log_lines.append("We are long; new short signal -> closing long first.")
-                                resp_close = close_position_if_any(
-                                    live_symbol, "long", live_qty, live_product
-                                )
-                                log_lines.append(f"Close long response: {resp_close}")
-                                st.session_state.live_position = "flat"
-
-                            if st.session_state.live_position == "short" and new_side == "BUY":
-                                log_lines.append("We are short; new long signal -> closing short first.")
-                                resp_close = close_position_if_any(
-                                    live_symbol, "short", live_qty, live_product
-                                )
-                                log_lines.append(f"Close short response: {resp_close}")
-                                st.session_state.live_position = "flat"
-
-                            # If flat, enter new trade
-                            if st.session_state.live_position == "flat":
-                                log_lines.append(f"Placing {new_side} order for {live_qty} on {live_symbol}")
-                                resp_open = place_market_order_fyers(
-                                    live_symbol, new_side, live_qty, live_product
-                                )
-                                log_lines.append(f"Open response: {resp_open}")
-                                st.session_state.live_position = "long" if new_side == "BUY" else "short"
-                                st.session_state.last_signal = sig
+                            live_symbol = current_month_future_symbol(underlying_root, exchange="NFO")
                         else:
-                            log_lines.append("Signal unchanged or not allowed by Trade Side; no new order.")
-                    else:
-                        log_lines.append("No crossover signal; no action.")
+                            live_symbol = fyers_symbol
 
-                # Show logs live
-                log_area.text("\n".join(log_lines))
+                        st.write(f"Live trading symbol: **{live_symbol}**, Qty per trade: **{live_qty}**")
 
-                time.sleep(check_interval)
+                        # ---------- Manual Mode ----------
+                        if live_mode == "Manual one-click":
+                            act_col1, act_col2, act_col3 = st.columns(3)
+                            with act_col1:
+                                if st.button("Manual BUY"):
+                                    st.info(f"Sending BUY {live_qty} on {live_symbol}")
+                                    resp = place_market_order_fyers(live_symbol, "BUY", live_qty, live_product)
+                                    st.write("Response:", resp)
+                                    st.session_state.live_position = "long"
+                            with act_col2:
+                                if st.button("Manual SELL"):
+                                    st.info(f"Sending SELL {live_qty} on {live_symbol}")
+                                    resp = place_market_order_fyers(live_symbol, "SELL", live_qty, live_product)
+                                    st.write("Response:", resp)
+                                    st.session_state.live_position = "short"
+                            with act_col3:
+                                if st.button("Close Position (opposite order)"):
+                                    st.info(f"Closing position on {live_symbol} using opposite order")
+                                    resp = close_position_if_any(
+                                        live_symbol,
+                                        st.session_state.live_position,
+                                        live_qty,
+                                        live_product
+                                    )
+                                    st.write("Response:", resp)
+                                    st.session_state.live_position = "flat"
 
-            st.session_state.auto_running = False
-            st.success("Auto trader loop finished (max checks reached).")
+                        # ---------- Auto Strategy Mode ----------
+                        else:
+                            st.markdown("### 🤖 Auto Trader Settings")
+                            check_interval = st.number_input(
+                                "Check interval (seconds)",
+                                min_value=10, max_value=900, value=60, step=10
+                            )
+                            max_checks = st.number_input(
+                                "Max checks in this run (safety)",
+                                min_value=1, max_value=1000, value=100, step=1
+                            )
+                            intraday_squareoff_hour = st.number_input(
+                                "Intraday square-off hour (24h, local time)",
+                                min_value=9, max_value=23, value=15
+                            )
+                            intraday_squareoff_min = st.number_input(
+                                "Intraday square-off minute",
+                                min_value=0, max_value=59, value=20
+                            )
+
+                            st.warning(
+                                "In auto mode the app loops inside this session, fetches latest candles, "
+                                "and places orders whenever a new MA crossover appears, respecting your "
+                                "Trade Side (Long/Short/Combined). It does NOT sync with Fyers positions."
+                            )
+
+                            start_auto = st.button("🚀 Start Auto Trader Loop")
+
+                            if start_auto:
+                                st.session_state.auto_running = True
+
+                            if st.session_state.auto_running:
+                                st.success("Auto trader is RUNNING in this session...")
+                                log_area = st.empty()
+
+                                for i in range(int(max_checks)):
+                                    now = dt.datetime.now()
+                                    now_time = now.time()
+                                    log_lines = []
+
+                                    latest_data = fetch_data(
+                                        fyers_symbol,
+                                        dt.date.today() - dt.timedelta(days=5),
+                                        dt.date.today(),
+                                        resolution
+                                    )
+                                    if latest_data.empty:
+                                        log_lines.append(f"[{now}] No recent data, skipping check {i+1}.")
+                                    else:
+                                        sig = latest_strategy_signal(
+                                            latest_data[['Open', 'High', 'Low', 'Close']],
+                                            ma_type,
+                                            fast_period,
+                                            slow_period
+                                        )
+                                        log_lines.append(
+                                            f"[{now}] Latest signal: {sig}, position: {st.session_state.live_position}"
+                                        )
+
+                                        # Intraday square-off
+                                        if trade_mode == "Intraday":
+                                            sq_time = dt.time(intraday_squareoff_hour, intraday_squareoff_min)
+                                            if now_time >= sq_time and st.session_state.live_position != "flat":
+                                                log_lines.append("Square-off time reached. Closing intraday position.")
+                                                resp = close_position_if_any(
+                                                    live_symbol,
+                                                    st.session_state.live_position,
+                                                    live_qty,
+                                                    live_product
+                                                )
+                                                log_lines.append(f"Square-off response: {resp}")
+                                                st.session_state.live_position = "flat"
+                                                st.session_state.last_signal = None
+
+                                        # Entry / flip logic
+                                        if sig is not None:
+                                            new_side = None
+                                            if sig == "long" and trade_side in ["Long Only", "Long & Short"]:
+                                                new_side = "BUY"
+                                            elif sig == "short" and trade_side in ["Short Only", "Long & Short"]:
+                                                new_side = "SELL"
+
+                                            if new_side and sig != st.session_state.last_signal:
+                                                log_lines.append(f"New actionable signal: {sig} ({new_side}).")
+
+                                                if st.session_state.live_position == "long" and new_side == "SELL":
+                                                    log_lines.append(
+                                                        "Currently long; new short signal -> closing long first."
+                                                    )
+                                                    resp_close = close_position_if_any(
+                                                        live_symbol, "long", live_qty, live_product
+                                                    )
+                                                    log_lines.append(f"Close long response: {resp_close}")
+                                                    st.session_state.live_position = "flat"
+
+                                                if st.session_state.live_position == "short" and new_side == "BUY":
+                                                    log_lines.append(
+                                                        "Currently short; new long signal -> closing short first."
+                                                    )
+                                                    resp_close = close_position_if_any(
+                                                        live_symbol, "short", live_qty, live_product
+                                                    )
+                                                    log_lines.append(f"Close short response: {resp_close}")
+                                                    st.session_state.live_position = "flat"
+
+                                                if st.session_state.live_position == "flat":
+                                                    log_lines.append(
+                                                        f"Placing {new_side} order for {live_qty} on {live_symbol}"
+                                                    )
+                                                    resp_open = place_market_order_fyers(
+                                                        live_symbol, new_side, live_qty, live_product
+                                                    )
+                                                    log_lines.append(f"Open response: {resp_open}")
+                                                    st.session_state.live_position = (
+                                                        "long" if new_side == "BUY" else "short"
+                                                    )
+                                                    st.session_state.last_signal = sig
+                                            else:
+                                                log_lines.append(
+                                                    "Signal unchanged or not allowed by Trade Side; no new order."
+                                                )
+                                        else:
+                                            log_lines.append("No crossover signal; no action.")
+
+                                    log_area.text("\n".join(log_lines))
+                                    time.sleep(check_interval)
+
+                                st.session_state.auto_running = False
+                                st.success("Auto trader loop finished (max checks reached).")
+    else:
+        st.info("Set parameters on the left and click **Run Backtest**.")
